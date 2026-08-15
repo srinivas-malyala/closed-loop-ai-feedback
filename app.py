@@ -18,8 +18,6 @@ import re
 import requests
 from databricks.sdk import WorkspaceClient
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
-from psycopg2 import sql
-
 import lakebase
 from github_client import GitHubClient
 
@@ -70,78 +68,7 @@ def _schema_for(username: str) -> str:
     return f"{STUDENT_SCHEMA_PREFIX}{username}"
 
 
-def ensure_student_schema(username: str, email: str):
-    """
-    Create (if missing) a dedicated Postgres schema for this student, plus
-    their own `github_repos` and `github_files` tables inside it - mirroring
-    the shape of the Delta Bronze tables (github_repos_bronze /
-    github_repo_files_bronze) so students can later copy/compare data
-    between the lake and their personal Lakebase schema.
 
-    Schema/table identifiers come from `sql.Identifier`, which quotes and
-    escapes them for safe interpolation - identifiers can't be passed as
-    query parameters (%s) the way values can, so this plus the username
-    validation above are the two layers protecting against SQL injection.
-
-    Ownership of the schema/tables is then reassigned from the app's shared
-    connection role to a Postgres role matching the student's email (these
-    per-user roles already exist in this Lakebase instance). Only the owner
-    of a table can run privileged DDL like `ALTER TABLE ... REPLICA
-    IDENTITY ...`, so without this, students would be stuck unable to set
-    replica identity on their own tables.
-    """
-    schema = _schema_for(username)
-    schema_ident = sql.Identifier(schema)
-    owner_ident = sql.Identifier(email)
-
-    with lakebase.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(schema_ident))
-            cur.execute(
-                sql.SQL(
-                    """
-                    CREATE TABLE IF NOT EXISTS {}.github_repos (
-                        id BIGINT,
-                        full_name TEXT NOT NULL,
-                        language TEXT,
-                        stargazers_count INTEGER,
-                        open_issues_count INTEGER,
-                        forks_count INTEGER,
-                        payload JSONB,
-                        ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                        PRIMARY KEY (full_name)
-                    )
-                    """
-                ).format(schema_ident)
-            )
-            cur.execute(
-                sql.SQL(
-                    """
-                    CREATE TABLE IF NOT EXISTS {}.github_files (
-                        repo_full_name TEXT NOT NULL,
-                        path TEXT NOT NULL,
-                        type TEXT,
-                        sha TEXT,
-                        size BIGINT,
-                        mode TEXT,
-                        tree_truncated BOOLEAN,
-                        ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                        PRIMARY KEY (repo_full_name, path)
-                    )
-                    """
-                ).format(schema_ident)
-            )
-            # Reassign ownership of the schema and both tables to the
-            # student's own Postgres role so they can run owner-only DDL
-            # (e.g. ALTER TABLE ... REPLICA IDENTITY ...).
-            cur.execute(sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(schema_ident, owner_ident))
-            cur.execute(
-                sql.SQL("ALTER TABLE {}.github_repos OWNER TO {}").format(schema_ident, owner_ident)
-            )
-            cur.execute(
-                sql.SQL("ALTER TABLE {}.github_files OWNER TO {}").format(schema_ident, owner_ident)
-            )
-            conn.commit()
 
 
 def ensure_watchlist_table():
@@ -235,7 +162,6 @@ def do_login():
             return jsonify({"error": str(exc)}), 400
         return render_template("login.html", error=str(exc)), 400
 
-    ensure_student_schema(username, _current_user_email())
     session["username"] = username
 
     if request.is_json:
