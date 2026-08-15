@@ -1,9 +1,3 @@
-# Databricks Asset Bundle configuration
-# See https://docs.databricks.com/dev-tools/bundles/index.html
-
-bundle:
-  name: ltap-lab-day1
-
 resources:
   jobs:
     process_repo_insights_on_change:
@@ -17,7 +11,7 @@ resources:
         table_update:
           condition: ALL_UPDATED
           table_names:
-            - "main.ltap_lab_day1.lb_github_repos_history"
+            - "bootcamp_student.abhibastia.lb_github_repos_history"
           min_time_between_triggers_seconds: 60
           wait_after_last_change_seconds: 60
 
@@ -26,14 +20,5 @@ resources:
           notebook_task:
             notebook_path: ./notebooks/day1_ingest/generate_repo_scd.py
             base_parameters:
-              catalog: "main"
+              catalog: "bootcamp"
               schema: "ltap_lab_day1"
-          existing_cluster_id: ${var.cluster_id}
-
-      queue:
-        enabled: true
-
-variables:
-  cluster_id:
-    description: "The cluster ID to run the workflow on"
-    default: ""
