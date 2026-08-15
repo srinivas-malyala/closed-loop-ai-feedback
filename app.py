@@ -161,20 +161,6 @@ def ensure_watchlist_table():
         )
         """
     )
-    # Add is_favorite column for existing tables that predate this change.
-    lakebase.run_write(
-        f"""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = '{WATCHLIST_TABLE_NAME}' AND column_name = 'is_favorite'
-            ) THEN
-                ALTER TABLE {WATCHLIST_TABLE_NAME} ADD COLUMN is_favorite BOOLEAN NOT NULL DEFAULT FALSE;
-            END IF;
-        END $$;
-        """
-    )
 
 
 def _current_user_email() -> str:
