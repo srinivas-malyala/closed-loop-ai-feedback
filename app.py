@@ -126,8 +126,7 @@ def _current_username() -> str | None:
 @app.route("/")
 def index():
     """Simple UI to add repos to a personal watchlist. Requires signing in
-    with a username first, which provisions that student's own Lakebase
-    schema/tables."""
+    with a username first."""
     username = _current_username()
     if not username:
         return redirect(url_for("login"))
@@ -146,9 +145,9 @@ def login():
 @app.route("/login", methods=["POST"])
 def do_login():
     """
-    Validate the submitted username as a safe Postgres schema fragment,
-    then provision (idempotently) a dedicated Lakebase schema for this
-    student containing empty `github_repos` and `github_files` tables.
+    Validate the submitted username as a safe Postgres schema fragment
+    and start a session. Students create their own schema/tables separately
+    using the SQL files in sql/.
     """
     if request.is_json:
         raw_username = request.json.get("username", "")
@@ -175,6 +174,37 @@ def logout():
     if request.is_json:
         return jsonify({"status": "ok"})
     return redirect(url_for("login"))
+
+
+@app.route("/schema/status")
+def schema_status():
+    """Check if the student's schema and tables exist in Lakebase."""
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
+
+    schema = _schema_for(username)
+    rows = lakebase.run_query(
+        """
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = %s AND table_name IN ('github_repos', 'github_files')
+        """,
+        (schema,),
+    )
+    existing_tables = [r["table_name"] for r in rows]
+
+    # Check if schema itself exists
+    schema_rows = lakebase.run_query(
+        "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+        (schema,),
+    )
+
+    return jsonify({
+        "schema": schema,
+        "schema_exists": len(schema_rows) > 0,
+        "github_repos_exists": "github_repos" in existing_tables,
+        "github_files_exists": "github_files" in existing_tables,
+    })
 
 
 @app.route("/watchlist", methods=["GET"])

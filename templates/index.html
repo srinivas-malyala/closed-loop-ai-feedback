@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>GitHub Repo Watchlist &amp; Insights</title>
+  <title>GitHub Repo Watchlist</title>
   <style>
     body { font-family: -apple-system, Arial, sans-serif; max-width: 720px; margin: 60px auto; color: #222; }
     h1 { font-size: 20px; }
@@ -24,6 +24,12 @@
     Signed in as <strong>{{ username }}</strong> (Lakebase schema <code>{{ schema }}</code>) -
     <form method="POST" action="/logout" style="display:inline;"><button type="submit" style="margin-top:0;">Sign out</button></form>
   </p>
+  <div id="schema-warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; border-radius:6px; padding:12px; margin-bottom:20px;">
+    <strong>⚠️ Schema setup incomplete.</strong>
+    <span id="schema-warning-detail"></span>
+    <p style="margin:8px 0 0; font-size:13px;">Run the SQL files in the <code>sql/</code> folder to create your schema and tables. See <code>sql/create_student_schema.sql</code>, <code>sql/create_github_repos.sql</code>, and <code>sql/create_github_files.sql</code>.</p>
+  </div>
+
   <p class="hint">Enter an "owner/repo" name. This sends exactly ONE call to the GitHub API to fetch current stats, then adds it to your personal watchlist.</p>
 
   <form id="repo-form">
@@ -47,27 +53,34 @@
     <tbody id="watchlist-body"></tbody>
   </table>
 
-  <h2>Spark-processed insights <span class="badge">read-only, synced from Delta</span></h2>
-  <p class="hint">This table is produced by notebooks/day2_processing/process_repo_insights.py (Spark aggregation + ranking over ingested repos) and kept in sync in Lakebase Postgres via a Databricks Synced Table - the app never writes to it.</p>
 
-  <table id="insights-table">
-    <thead>
-      <tr>
-        <th>Repo</th>
-        <th>Language</th>
-        <th>Stars</th>
-        <th>Rank in language</th>
-        <th>Popularity score</th>
-      </tr>
-    </thead>
-    <tbody id="insights-body"></tbody>
-  </table>
 
   <script>
     const form = document.getElementById("repo-form");
     const resultEl = document.getElementById("result");
     const watchlistBody = document.getElementById("watchlist-body");
-    const insightsBody = document.getElementById("insights-body");
+    const schemaWarning = document.getElementById("schema-warning");
+    const schemaWarningDetail = document.getElementById("schema-warning-detail");
+
+    async function checkSchemaStatus() {
+      try {
+        const resp = await fetch("/schema/status");
+        const data = await resp.json();
+        if (!resp.ok) return;
+
+        const missing = [];
+        if (!data.schema_exists) missing.push("schema " + data.schema);
+        if (!data.github_repos_exists) missing.push("table github_repos");
+        if (!data.github_files_exists) missing.push("table github_files");
+
+        if (missing.length > 0) {
+          schemaWarningDetail.textContent = " Missing: " + missing.join(", ") + ".";
+          schemaWarning.style.display = "block";
+        }
+      } catch (err) {
+        // Silently ignore - non-critical check
+      }
+    }
 
     async function loadWatchlist() {
       try {
@@ -86,25 +99,6 @@
         });
       } catch (err) {
         resultEl.textContent = "Failed to load watchlist: " + err;
-      }
-    }
-
-    async function loadInsights() {
-      try {
-        const resp = await fetch("/insights?limit=25");
-        const data = await resp.json();
-        if (!resp.ok) {
-          insightsBody.innerHTML = `<tr><td colspan="5">Error loading insights: ${data.error || resp.statusText}</td></tr>`;
-          return;
-        }
-        insightsBody.innerHTML = "";
-        data.forEach((row) => {
-          const tr = document.createElement("tr");
-          tr.innerHTML = `<td>${row.full_name}</td><td>${row.language || "-"}</td><td>${row.stargazers_count ?? "-"}</td><td>${row.rank_in_language ?? "-"}</td><td>${row.popularity_score ?? "-"}</td>`;
-          insightsBody.appendChild(tr);
-        });
-      } catch (err) {
-        insightsBody.innerHTML = `<tr><td colspan="5">Failed to load insights: ${err}</td></tr>`;
       }
     }
 
@@ -132,8 +126,8 @@
       }
     });
 
+    checkSchemaStatus();
     loadWatchlist();
-    loadInsights();
   </script>
 </body>
 </html>
