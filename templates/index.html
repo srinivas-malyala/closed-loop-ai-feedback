@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>GitHub Repo Watchlist &amp; Insights</title>
+  <style>
+    body { font-family: -apple-system, Arial, sans-serif; max-width: 720px; margin: 60px auto; color: #222; }
+    h1 { font-size: 20px; }
+    h2 { font-size: 16px; margin-top: 48px; }
+    label { display: block; margin-top: 16px; font-weight: 600; }
+    input[type="text"] { width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 8px 16px; cursor: pointer; }
+    #result { margin-top: 20px; white-space: pre-wrap; background: #f6f6f6; padding: 12px; border-radius: 6px; min-height: 20px; }
+    .hint { color: #777; font-size: 13px; margin-top: 4px; }
+    table { width: 100%; margin-top: 24px; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
+    th { font-size: 13px; color: #555; text-transform: uppercase; }
+    .badge { display: inline-block; background: #eef; color: #335; border-radius: 4px; padding: 2px 6px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>GitHub Repo Watchlist</h1>
+  <p class="hint">
+    Signed in as <strong>{{ username }}</strong> (Lakebase schema <code>{{ schema }}</code>) -
+    <form method="POST" action="/logout" style="display:inline;"><button type="submit" style="margin-top:0;">Sign out</button></form>
+  </p>
+  <p class="hint">Enter an "owner/repo" name. This sends exactly ONE call to the GitHub API to fetch current stats, then adds it to your personal watchlist.</p>
+
+  <form id="repo-form">
+    <label for="full_name">Repository (owner/repo)</label>
+    <input type="text" id="full_name" name="full_name" placeholder="databricks/spark" required>
+    <button type="submit">Add to watchlist</button>
+  </form>
+
+  <div id="result"></div>
+
+  <table id="watchlist-table">
+    <thead>
+      <tr>
+        <th>Repo</th>
+        <th>Email</th>
+        <th>Stars</th>
+        <th>Open issues</th>
+        <th>Updated</th>
+      </tr>
+    </thead>
+    <tbody id="watchlist-body"></tbody>
+  </table>
+
+  <h2>Spark-processed insights <span class="badge">read-only, synced from Delta</span></h2>
+  <p class="hint">This table is produced by notebooks/day2_processing/process_repo_insights.py (Spark aggregation + ranking over ingested repos) and kept in sync in Lakebase Postgres via a Databricks Synced Table - the app never writes to it.</p>
+
+  <table id="insights-table">
+    <thead>
+      <tr>
+        <th>Repo</th>
+        <th>Language</th>
+        <th>Stars</th>
+        <th>Rank in language</th>
+        <th>Popularity score</th>
+      </tr>
+    </thead>
+    <tbody id="insights-body"></tbody>
+  </table>
+
+  <script>
+    const form = document.getElementById("repo-form");
+    const resultEl = document.getElementById("result");
+    const watchlistBody = document.getElementById("watchlist-body");
+    const insightsBody = document.getElementById("insights-body");
+
+    async function loadWatchlist() {
+      try {
+        const resp = await fetch("/watchlist");
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error loading watchlist: " + (data.error || resp.statusText);
+          return;
+        }
+        watchlistBody.innerHTML = "";
+        data.forEach((row) => {
+          const tr = document.createElement("tr");
+          const updated = row.updated_at ? new Date(row.updated_at).toLocaleString() : "-";
+          tr.innerHTML = `<td>${row.full_name}</td><td>${row.email || "-"}</td><td>${row.stars ?? "-"}</td><td>${row.open_issues ?? "-"}</td><td>${updated}</td>`;
+          watchlistBody.appendChild(tr);
+        });
+      } catch (err) {
+        resultEl.textContent = "Failed to load watchlist: " + err;
+      }
+    }
+
+    async function loadInsights() {
+      try {
+        const resp = await fetch("/insights?limit=25");
+        const data = await resp.json();
+        if (!resp.ok) {
+          insightsBody.innerHTML = `<tr><td colspan="5">Error loading insights: ${data.error || resp.statusText}</td></tr>`;
+          return;
+        }
+        insightsBody.innerHTML = "";
+        data.forEach((row) => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `<td>${row.full_name}</td><td>${row.language || "-"}</td><td>${row.stargazers_count ?? "-"}</td><td>${row.rank_in_language ?? "-"}</td><td>${row.popularity_score ?? "-"}</td>`;
+          insightsBody.appendChild(tr);
+        });
+      } catch (err) {
+        insightsBody.innerHTML = `<tr><td colspan="5">Failed to load insights: ${err}</td></tr>`;
+      }
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const full_name = document.getElementById("full_name").value;
+      resultEl.textContent = "Adding to watchlist...";
+
+      try {
+        const resp = await fetch("/watchlist", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ full_name }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          resultEl.textContent = "Error: " + (data.error || resp.statusText);
+          return;
+        }
+        resultEl.textContent = "Added " + data.full_name + " (" + data.stars + " stars)";
+        document.getElementById("full_name").value = "";
+        loadWatchlist();
+      } catch (err) {
+        resultEl.textContent = "Request failed: " + err;
+      }
+    });
+
+    loadWatchlist();
+    loadInsights();
+  </script>
+</body>
+</html>

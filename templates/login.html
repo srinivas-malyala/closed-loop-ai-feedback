@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sign in - GitHub Repo Watchlist</title>
+  <style>
+    body { font-family: -apple-system, Arial, sans-serif; max-width: 420px; margin: 120px auto; color: #222; }
+    h1 { font-size: 20px; }
+    p.hint { color: #777; font-size: 13px; }
+    label { display: block; margin-top: 16px; font-weight: 600; }
+    input[type="text"] { width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 8px 16px; cursor: pointer; }
+    .error { color: #b00020; margin-top: 12px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Sign in</h1>
+  <p class="hint">
+    Enter a username to sign in. This provisions your own Lakebase schema
+    (<code>student_&lt;username&gt;</code>) with empty <code>github_repos</code>
+    and <code>github_files</code> tables the first time you sign in.
+  </p>
+
+  {% if error %}
+  <p class="error">{{ error }}</p>
+  {% endif %}
+
+  <form id="login-form" method="POST" action="/login">
+    <label for="username">Username</label>
+    <input
+      type="text"
+      id="username"
+      name="username"
+      placeholder="ada"
+      pattern="[a-z_][a-z0-9_]{0,55}"
+      title="Lowercase letters, digits, underscores; must start with a letter or underscore."
+      required
+      autofocus
+    >
+    <button type="submit">Sign in</button>
+  </form>
+</body>
+</html>
