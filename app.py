@@ -155,9 +155,24 @@ def ensure_watchlist_table():
             email TEXT NOT NULL,
             stars INTEGER,
             open_issues INTEGER,
+            is_favorite BOOLEAN NOT NULL DEFAULT FALSE,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (full_name, email)
         )
+        """
+    )
+    # Add is_favorite column for existing tables that predate this change.
+    lakebase.run_write(
+        f"""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = '{WATCHLIST_TABLE_NAME}' AND column_name = 'is_favorite'
+            ) THEN
+                ALTER TABLE {WATCHLIST_TABLE_NAME} ADD COLUMN is_favorite BOOLEAN NOT NULL DEFAULT FALSE;
+            END IF;
+        END $$;
         """
     )
 
@@ -258,7 +273,7 @@ def get_watchlist():
     ensure_watchlist_table()
     email = _current_user_email()
     rows = lakebase.run_query(
-        f"SELECT full_name, email, stars, open_issues, updated_at FROM {WATCHLIST_TABLE_NAME} "
+        f"SELECT full_name, email, stars, open_issues, is_favorite, updated_at FROM {WATCHLIST_TABLE_NAME} "
         f"WHERE email = %s ORDER BY full_name ASC",
         (email,),
     )
@@ -310,6 +325,74 @@ def add_to_watchlist():
     )
 
     return jsonify({"full_name": full_name, "email": email, "stars": stars, "open_issues": open_issues})
+
+
+@app.route("/watchlist/favorite", methods=["POST"])
+def toggle_favorite():
+    """
+    Mark or unmark a repo as a favorite on the current user's watchlist.
+    Expects {"full_name": "owner/repo", "is_favorite": true/false}.
+    """
+    ensure_watchlist_table()
+
+    if request.is_json:
+        full_name = request.json.get("full_name", "")
+        is_favorite = request.json.get("is_favorite", True)
+    else:
+        full_name = request.form.get("full_name", "")
+        is_favorite = request.form.get("is_favorite", "true").lower() in ("true", "1", "yes")
+
+    full_name = full_name.strip() if isinstance(full_name, str) else ""
+
+    if not full_name or not _REPO_RE.match(full_name):
+        return jsonify({"error": f"Invalid repo name (expected owner/repo): {full_name!r}"}), 400
+
+    email = _current_user_email()
+
+    affected = lakebase.run_write(
+        f"""
+        UPDATE {WATCHLIST_TABLE_NAME}
+        SET is_favorite = %s, updated_at = now()
+        WHERE full_name = %s AND email = %s
+        """,
+        (bool(is_favorite), full_name, email),
+    )
+
+    if affected == 0:
+        return jsonify({"error": f"Repo not on your watchlist: {full_name!r}"}), 404
+
+    return jsonify({"full_name": full_name, "is_favorite": bool(is_favorite)})
+
+
+@app.route("/watchlist", methods=["DELETE"])
+def remove_from_watchlist():
+    """
+    Remove a repo from the current user's watchlist.
+    Expects {"full_name": "owner/repo"}.
+    """
+    ensure_watchlist_table()
+
+    if request.is_json:
+        full_name = request.json.get("full_name", "")
+    else:
+        full_name = request.form.get("full_name", "")
+
+    full_name = full_name.strip() if isinstance(full_name, str) else ""
+
+    if not full_name or not _REPO_RE.match(full_name):
+        return jsonify({"error": f"Invalid repo name (expected owner/repo): {full_name!r}"}), 400
+
+    email = _current_user_email()
+
+    affected = lakebase.run_write(
+        f"DELETE FROM {WATCHLIST_TABLE_NAME} WHERE full_name = %s AND email = %s",
+        (full_name, email),
+    )
+
+    if affected == 0:
+        return jsonify({"error": f"Repo not on your watchlist: {full_name!r}"}), 404
+
+    return jsonify({"full_name": full_name, "removed": True})
 
 
 if __name__ == '__main__':
