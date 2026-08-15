@@ -13,7 +13,3 @@ env:
     value: "github"
   - name: GITHUB_SECRET_KEY
     value: "token"
-  - name: WATCHLIST_TABLE_NAME
-    value: "watchlist"
-  - name: INSIGHTS_TABLE_NAME
-    value: "github_repo_insights_gold"

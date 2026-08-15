@@ -2,11 +2,10 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>GitHub Repo Watchlist</title>
+  <title>GitHub Repo Explorer</title>
   <style>
     body { font-family: -apple-system, Arial, sans-serif; max-width: 720px; margin: 60px auto; color: #222; }
     h1 { font-size: 20px; }
-    h2 { font-size: 16px; margin-top: 48px; }
     label { display: block; margin-top: 16px; font-weight: 600; }
     input[type="text"] { width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box; }
     button { margin-top: 16px; padding: 8px 16px; cursor: pointer; }
@@ -15,50 +14,52 @@
     table { width: 100%; margin-top: 24px; border-collapse: collapse; }
     th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
     th { font-size: 13px; color: #555; text-transform: uppercase; }
-    .badge { display: inline-block; background: #eef; color: #335; border-radius: 4px; padding: 2px 6px; font-size: 12px; }
+    .fav-btn { cursor: pointer; background: none; border: none; font-size: 18px; padding: 0 4px; }
+    .del-btn { cursor: pointer; background: none; border: none; font-size: 14px; color: #b00020; padding: 0 4px; }
   </style>
 </head>
 <body>
-  <h1>GitHub Repo Watchlist</h1>
+  <h1>GitHub Repo Explorer</h1>
   <p class="hint">
     Signed in as <strong>{{ username }}</strong> (Lakebase schema <code>{{ schema }}</code>) -
     <form method="POST" action="/logout" style="display:inline;"><button type="submit" style="margin-top:0;">Sign out</button></form>
   </p>
+
   <div id="schema-warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; border-radius:6px; padding:12px; margin-bottom:20px;">
     <strong>⚠️ Schema setup incomplete.</strong>
     <span id="schema-warning-detail"></span>
     <p style="margin:8px 0 0; font-size:13px;">Run the SQL files in the <code>sql/</code> folder to create your schema and tables. See <code>sql/create_student_schema.sql</code>, <code>sql/create_github_repos.sql</code>, and <code>sql/create_github_files.sql</code>.</p>
   </div>
 
-  <p class="hint">Enter an "owner/repo" name. This sends exactly ONE call to the GitHub API to fetch current stats, then adds it to your personal watchlist.</p>
+  <p class="hint">Enter an "owner/repo" name. This fetches stats from GitHub and adds it to your <code>github_repos</code> table.</p>
 
   <form id="repo-form">
     <label for="full_name">Repository (owner/repo)</label>
     <input type="text" id="full_name" name="full_name" placeholder="databricks/spark" required>
-    <button type="submit">Add to watchlist</button>
+    <button type="submit">Add repo</button>
   </form>
 
   <div id="result"></div>
 
-  <table id="watchlist-table">
+  <table id="repos-table">
     <thead>
       <tr>
         <th>Repo</th>
-        <th>Email</th>
+        <th>Language</th>
         <th>Stars</th>
-        <th>Open issues</th>
-        <th>Updated</th>
+        <th>Open Issues</th>
+        <th>Forks</th>
+        <th>Fav</th>
+        <th></th>
       </tr>
     </thead>
-    <tbody id="watchlist-body"></tbody>
+    <tbody id="repos-body"></tbody>
   </table>
-
-
 
   <script>
     const form = document.getElementById("repo-form");
     const resultEl = document.getElementById("result");
-    const watchlistBody = document.getElementById("watchlist-body");
+    const reposBody = document.getElementById("repos-body");
     const schemaWarning = document.getElementById("schema-warning");
     const schemaWarningDetail = document.getElementById("schema-warning-detail");
 
@@ -77,38 +78,64 @@
           schemaWarningDetail.textContent = " Missing: " + missing.join(", ") + ".";
           schemaWarning.style.display = "block";
         }
+      } catch (err) {}
+    }
+
+    async function loadRepos() {
+      try {
+        const resp = await fetch("/repos");
+        const data = await resp.json();
+        if (!resp.ok) {
+          if (resp.status === 404) return; // table doesn't exist yet
+          resultEl.textContent = "Error loading repos: " + (data.error || resp.statusText);
+          return;
+        }
+        reposBody.innerHTML = "";
+        data.forEach((row) => {
+          const tr = document.createElement("tr");
+          const favIcon = row.is_favorite ? "⭐" : "☆";
+          tr.innerHTML = `<td>${row.full_name}</td><td>${row.language || "-"}</td><td>${row.stargazers_count ?? "-"}</td><td>${row.open_issues_count ?? "-"}</td><td>${row.forks_count ?? "-"}</td><td><button class="fav-btn" onclick="toggleFav('${row.full_name}', ${!row.is_favorite})">${favIcon}</button></td><td><button class="del-btn" onclick="removeRepo('${row.full_name}')">✕</button></td>`;
+          reposBody.appendChild(tr);
+        });
       } catch (err) {
-        // Silently ignore - non-critical check
+        resultEl.textContent = "Failed to load repos: " + err;
       }
     }
 
-    async function loadWatchlist() {
+    async function toggleFav(fullName, isFavorite) {
       try {
-        const resp = await fetch("/watchlist");
-        const data = await resp.json();
-        if (!resp.ok) {
-          resultEl.textContent = "Error loading watchlist: " + (data.error || resp.statusText);
-          return;
-        }
-        watchlistBody.innerHTML = "";
-        data.forEach((row) => {
-          const tr = document.createElement("tr");
-          const updated = row.updated_at ? new Date(row.updated_at).toLocaleString() : "-";
-          tr.innerHTML = `<td>${row.full_name}</td><td>${row.email || "-"}</td><td>${row.stars ?? "-"}</td><td>${row.open_issues ?? "-"}</td><td>${updated}</td>`;
-          watchlistBody.appendChild(tr);
+        const resp = await fetch("/repos/favorite", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ full_name: fullName, is_favorite: isFavorite }),
         });
+        if (resp.ok) loadRepos();
       } catch (err) {
-        resultEl.textContent = "Failed to load watchlist: " + err;
+        resultEl.textContent = "Failed to toggle favorite: " + err;
+      }
+    }
+
+    async function removeRepo(fullName) {
+      if (!confirm("Remove " + fullName + "?")) return;
+      try {
+        const resp = await fetch("/repos", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ full_name: fullName }),
+        });
+        if (resp.ok) loadRepos();
+      } catch (err) {
+        resultEl.textContent = "Failed to remove repo: " + err;
       }
     }
 
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const full_name = document.getElementById("full_name").value;
-      resultEl.textContent = "Adding to watchlist...";
+      resultEl.textContent = "Adding repo...";
 
       try {
-        const resp = await fetch("/watchlist", {
+        const resp = await fetch("/repos", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ full_name }),
@@ -118,16 +145,16 @@
           resultEl.textContent = "Error: " + (data.error || resp.statusText);
           return;
         }
-        resultEl.textContent = "Added " + data.full_name + " (" + data.stars + " stars)";
+        resultEl.textContent = "Added " + data.full_name + " (" + data.stargazers_count + " stars)";
         document.getElementById("full_name").value = "";
-        loadWatchlist();
+        loadRepos();
       } catch (err) {
         resultEl.textContent = "Request failed: " + err;
       }
     });
 
     checkSchemaStatus();
-    loadWatchlist();
+    loadRepos();
   </script>
 </body>
 </html>

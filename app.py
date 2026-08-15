@@ -1,9 +1,9 @@
 """
-Databricks App: GitHub Repo Watchlist
+Databricks App: GitHub Repo Explorer
 
 - Serves a small Flask API
-- Reads/writes a personal "watchlist" of GitHub repos in Lakebase (Databricks-
-  managed Postgres) via lakebase.py, using a single GitHub API call per add
+- Reads/writes repos to the student's own Lakebase schema
+  (student_<username>.github_repos) using a single GitHub API call per add
   (see github_client.py:get_repo)
 
 Run locally:
@@ -16,7 +16,6 @@ import os
 import re
 
 import requests
-from databricks.sdk import WorkspaceClient
 from flask import Flask, jsonify, redirect, render_template, request, session, url_for
 import lakebase
 from github_client import GitHubClient
@@ -26,9 +25,6 @@ logger = logging.getLogger("github-insights-app")
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32)
-_w = WorkspaceClient()
-
-WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
 
 # "owner/repo" shape check, e.g. "databricks/spark" or "sylph-ai/adal".
 _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
@@ -71,35 +67,7 @@ def _schema_for(username: str) -> str:
 
 
 
-def ensure_watchlist_table():
-    """Create the watchlist table in Lakebase if it doesn't exist yet."""
-    lakebase.run_write(
-        f"""
-        CREATE TABLE IF NOT EXISTS {WATCHLIST_TABLE_NAME} (
-            full_name TEXT NOT NULL,
-            email TEXT NOT NULL,
-            stars INTEGER,
-            open_issues INTEGER,
-            is_favorite BOOLEAN NOT NULL DEFAULT FALSE,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            PRIMARY KEY (full_name, email)
-        )
-        """
-    )
 
-
-def _current_user_email() -> str:
-    """
-    Resolve the current user's email so the watchlist can be personalized.
-
-    Databricks Apps inject the logged-in user's identity via the
-    X-Forwarded-Email header on every request. Fall back to the Databricks
-    SDK's current_user API for local development where that header isn't set.
-    """
-    header_email = request.headers.get("X-Forwarded-Email")
-    if header_email:
-        return header_email
-    return _w.current_user.me().user_name
 
 
 @app.route("/healthz")
@@ -125,8 +93,7 @@ def _current_username() -> str | None:
 
 @app.route("/")
 def index():
-    """Simple UI to add repos to a personal watchlist. Requires signing in
-    with a username first."""
+    """Simple UI to add repos. Requires signing in with a username first."""
     username = _current_username()
     if not username:
         return redirect(url_for("login"))
@@ -207,27 +174,38 @@ def schema_status():
     })
 
 
-@app.route("/watchlist", methods=["GET"])
-def get_watchlist():
-    """Return the current user's watched repos, with their last known stats."""
-    ensure_watchlist_table()
-    email = _current_user_email()
-    rows = lakebase.run_query(
-        f"SELECT full_name, email, stars, open_issues, is_favorite, updated_at FROM {WATCHLIST_TABLE_NAME} "
-        f"WHERE email = %s ORDER BY full_name ASC",
-        (email,),
-    )
+@app.route("/repos", methods=["GET"])
+def get_repos():
+    """Return the repos in the student's github_repos table."""
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
+
+    schema = _schema_for(username)
+    try:
+        rows = lakebase.run_query(
+            f"SELECT full_name, language, stargazers_count, open_issues_count, "
+            f"forks_count, is_favorite, ingested_at "
+            f"FROM {schema}.github_repos ORDER BY full_name ASC"
+        )
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return jsonify({"error": "Table not found. Please create your schema and tables first (see sql/ folder)."}), 404
+        raise
+
     return jsonify(rows)
 
 
-@app.route("/watchlist", methods=["POST"])
-def add_to_watchlist():
+@app.route("/repos", methods=["POST"])
+def add_repo():
     """
     Fetch the latest stats for a single "owner/repo" from GitHub using
-    exactly ONE API call (see GitHubClient.get_repo), then add/update that
-    repo on the current user's watchlist in Lakebase.
+    exactly ONE API call (see GitHubClient.get_repo), then insert/update
+    it in the student's github_repos table.
     """
-    ensure_watchlist_table()
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
 
     if request.is_json:
         full_name = request.json.get("full_name", "")
@@ -243,37 +221,57 @@ def add_to_watchlist():
     try:
         data = client.get_repo(full_name)
     except requests.HTTPError:
-        # GitHub returns a 404 for repos it doesn't recognize (or private
-        # repos the token can't see).
         return jsonify({"error": f"Unknown repo: {full_name}"}), 400
 
-    stars = data.get("stargazers_count")
-    open_issues = data.get("open_issues_count")
+    schema = _schema_for(username)
 
-    email = _current_user_email()
+    try:
+        lakebase.run_write(
+            f"""
+            INSERT INTO {schema}.github_repos
+                (id, full_name, language, stargazers_count, open_issues_count, forks_count, payload, ingested_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (full_name) DO UPDATE
+                SET stargazers_count = EXCLUDED.stargazers_count,
+                    open_issues_count = EXCLUDED.open_issues_count,
+                    forks_count = EXCLUDED.forks_count,
+                    language = EXCLUDED.language,
+                    payload = EXCLUDED.payload,
+                    ingested_at = EXCLUDED.ingested_at
+            """,
+            (
+                data.get("id"),
+                full_name,
+                data.get("language"),
+                data.get("stargazers_count"),
+                data.get("open_issues_count"),
+                data.get("forks_count"),
+                __import__("json").dumps(data),
+            ),
+        )
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return jsonify({"error": "Table not found. Please create your schema and tables first (see sql/ folder)."}), 404
+        raise
 
-    lakebase.run_write(
-        f"""
-        INSERT INTO {WATCHLIST_TABLE_NAME} (full_name, email, stars, open_issues, updated_at)
-        VALUES (%s, %s, %s, %s, now())
-        ON CONFLICT (full_name, email) DO UPDATE
-            SET stars = EXCLUDED.stars,
-                open_issues = EXCLUDED.open_issues,
-                updated_at = EXCLUDED.updated_at
-        """,
-        (full_name, email, stars, open_issues),
-    )
-
-    return jsonify({"full_name": full_name, "email": email, "stars": stars, "open_issues": open_issues})
+    return jsonify({
+        "full_name": full_name,
+        "language": data.get("language"),
+        "stargazers_count": data.get("stargazers_count"),
+        "open_issues_count": data.get("open_issues_count"),
+        "forks_count": data.get("forks_count"),
+    })
 
 
-@app.route("/watchlist/favorite", methods=["POST"])
+@app.route("/repos/favorite", methods=["POST"])
 def toggle_favorite():
     """
-    Mark or unmark a repo as a favorite on the current user's watchlist.
+    Mark or unmark a repo as a favorite.
     Expects {"full_name": "owner/repo", "is_favorite": true/false}.
     """
-    ensure_watchlist_table()
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
 
     if request.is_json:
         full_name = request.json.get("full_name", "")
@@ -287,30 +285,33 @@ def toggle_favorite():
     if not full_name or not _REPO_RE.match(full_name):
         return jsonify({"error": f"Invalid repo name (expected owner/repo): {full_name!r}"}), 400
 
-    email = _current_user_email()
+    schema = _schema_for(username)
 
-    affected = lakebase.run_write(
-        f"""
-        UPDATE {WATCHLIST_TABLE_NAME}
-        SET is_favorite = %s, updated_at = now()
-        WHERE full_name = %s AND email = %s
-        """,
-        (bool(is_favorite), full_name, email),
-    )
+    try:
+        affected = lakebase.run_write(
+            f"UPDATE {schema}.github_repos SET is_favorite = %s WHERE full_name = %s",
+            (bool(is_favorite), full_name),
+        )
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return jsonify({"error": "Table not found. Please create your schema and tables first (see sql/ folder)."}), 404
+        raise
 
     if affected == 0:
-        return jsonify({"error": f"Repo not on your watchlist: {full_name!r}"}), 404
+        return jsonify({"error": f"Repo not found: {full_name!r}"}), 404
 
     return jsonify({"full_name": full_name, "is_favorite": bool(is_favorite)})
 
 
-@app.route("/watchlist", methods=["DELETE"])
-def remove_from_watchlist():
+@app.route("/repos", methods=["DELETE"])
+def remove_repo():
     """
-    Remove a repo from the current user's watchlist.
+    Remove a repo from the student's github_repos table.
     Expects {"full_name": "owner/repo"}.
     """
-    ensure_watchlist_table()
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
 
     if request.is_json:
         full_name = request.json.get("full_name", "")
@@ -322,15 +323,20 @@ def remove_from_watchlist():
     if not full_name or not _REPO_RE.match(full_name):
         return jsonify({"error": f"Invalid repo name (expected owner/repo): {full_name!r}"}), 400
 
-    email = _current_user_email()
+    schema = _schema_for(username)
 
-    affected = lakebase.run_write(
-        f"DELETE FROM {WATCHLIST_TABLE_NAME} WHERE full_name = %s AND email = %s",
-        (full_name, email),
-    )
+    try:
+        affected = lakebase.run_write(
+            f"DELETE FROM {schema}.github_repos WHERE full_name = %s",
+            (full_name,),
+        )
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return jsonify({"error": "Table not found. Please create your schema and tables first (see sql/ folder)."}), 404
+        raise
 
     if affected == 0:
-        return jsonify({"error": f"Repo not on your watchlist: {full_name!r}"}), 404
+        return jsonify({"error": f"Repo not found: {full_name!r}"}), 404
 
     return jsonify({"full_name": full_name, "removed": True})
 

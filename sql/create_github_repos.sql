@@ -1,6 +1,7 @@
 -- Exercise: Create the github_repos table in your student schema.
 -- Replace <username> with your username.
--- This table mirrors the shape of the github_repos_bronze Delta table.
+-- This table mirrors the shape of the github_repos_bronze Delta table,
+-- with an added is_favorite column for marking repos you like.
 
 CREATE TABLE IF NOT EXISTS student_<username>.github_repos (
     id BIGINT,
@@ -9,6 +10,7 @@ CREATE TABLE IF NOT EXISTS student_<username>.github_repos (
     stargazers_count INTEGER,
     open_issues_count INTEGER,
     forks_count INTEGER,
+    is_favorite BOOLEAN NOT NULL DEFAULT FALSE,
     payload JSONB,
     ingested_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (full_name)
