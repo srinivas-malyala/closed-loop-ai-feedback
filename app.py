@@ -78,7 +78,7 @@ def _schema_for(username: str) -> str:
     return f"{STUDENT_SCHEMA_PREFIX}{username}"
 
 
-def ensure_student_schema(username: str):
+def ensure_student_schema(username: str, email: str):
     """
     Create (if missing) a dedicated Postgres schema for this student, plus
     their own `github_repos` and `github_files` tables inside it - mirroring
@@ -90,9 +90,17 @@ def ensure_student_schema(username: str):
     escapes them for safe interpolation - identifiers can't be passed as
     query parameters (%s) the way values can, so this plus the username
     validation above are the two layers protecting against SQL injection.
+
+    Ownership of the schema/tables is then reassigned from the app's shared
+    connection role to a Postgres role matching the student's email (these
+    per-user roles already exist in this Lakebase instance). Only the owner
+    of a table can run privileged DDL like `ALTER TABLE ... REPLICA
+    IDENTITY ...`, so without this, students would be stuck unable to set
+    replica identity on their own tables.
     """
     schema = _schema_for(username)
     schema_ident = sql.Identifier(schema)
+    owner_ident = sql.Identifier(email)
 
     with lakebase.get_connection() as conn:
         with conn.cursor() as cur:
@@ -130,6 +138,18 @@ def ensure_student_schema(username: str):
                     )
                     """
                 ).format(schema_ident)
+            )
+            # Reassigning ownership requires the connecting role to be a
+            # member of the target role (or a superuser) - grant it first,
+            # idempotently, then hand over ownership of the schema and both
+            # tables to the student's own Postgres role.
+            cur.execute(sql.SQL("GRANT {} TO CURRENT_USER").format(owner_ident))
+            cur.execute(sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(schema_ident, owner_ident))
+            cur.execute(
+                sql.SQL("ALTER TABLE {}.github_repos OWNER TO {}").format(schema_ident, owner_ident)
+            )
+            cur.execute(
+                sql.SQL("ALTER TABLE {}.github_files OWNER TO {}").format(schema_ident, owner_ident)
             )
             conn.commit()
 
@@ -224,7 +244,7 @@ def do_login():
             return jsonify({"error": str(exc)}), 400
         return render_template("login.html", error=str(exc)), 400
 
-    ensure_student_schema(username)
+    ensure_student_schema(username, _current_user_email())
     session["username"] = username
 
     if request.is_json:

@@ -181,11 +181,18 @@ On successful sign-in, the app runs (idempotently, safe to repeat):
 CREATE SCHEMA IF NOT EXISTS student_<username>;
 CREATE TABLE IF NOT EXISTS student_<username>.github_repos (...);
 CREATE TABLE IF NOT EXISTS student_<username>.github_files (...);
+ALTER SCHEMA student_<username> OWNER TO "<student-email>";
+ALTER TABLE student_<username>.github_repos OWNER TO "<student-email>";
+ALTER TABLE student_<username>.github_files OWNER TO "<student-email>";
 ```
 
 Each student gets their own empty `github_repos` / `github_files` tables (matching the shape of the
 `github_repos_bronze` / `github_repo_files_bronze` Delta tables) to practice loading and querying
-data in Lakebase under their own schema, isolated from every other student.
+data in Lakebase under their own schema, isolated from every other student. Ownership of the
+schema and both tables is reassigned to a Postgres role matching the student's email (these
+per-user roles already exist in this Lakebase instance) - this is required for students to run
+owner-only DDL themselves, such as `ALTER TABLE ... REPLICA IDENTITY ...`, which Postgres does not
+allow via `GRANT`s alone.
 
 ## Demo narrative (suggested flow)
 
