@@ -1,14 +1,10 @@
 """
-Databricks App: GitHub Repo Watchlist + Spark-processed Insights
+Databricks App: GitHub Repo Watchlist
 
 - Serves a small Flask API
 - Reads/writes a personal "watchlist" of GitHub repos in Lakebase (Databricks-
   managed Postgres) via lakebase.py, using a single GitHub API call per add
   (see github_client.py:get_repo)
-- Reads a READ-ONLY "insights" table that Databricks Synced Tables keeps in
-  sync from a Unity Catalog Delta table produced by Spark
-  (notebooks/day2_processing/process_repo_insights.py) - this is the "heavy processing in the
-  lake, surfaced back in the app" part of the demo.
 
 Run locally:
     python app.py
@@ -35,10 +31,6 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32)
 _w = WorkspaceClient()
 
 WATCHLIST_TABLE_NAME = os.environ.get("WATCHLIST_TABLE_NAME", "watchlist")
-# This table is NOT created by ensure_table() below - it is created and kept
-# up to date by a Databricks Synced Table pointing at the Gold Delta table
-# produced by notebooks/day2_processing/process_repo_insights.py. See README.md for setup.
-INSIGHTS_TABLE_NAME = os.environ.get("INSIGHTS_TABLE_NAME", "github_repo_insights_gold")
 
 # "owner/repo" shape check, e.g. "databricks/spark" or "sylph-ai/adal".
 _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
@@ -207,9 +199,9 @@ def _current_username() -> str | None:
 
 @app.route("/")
 def index():
-    """Simple UI to add repos to a personal watchlist and browse Spark-
-    processed language insights. Requires signing in with a username first,
-    which provisions that student's own Lakebase schema/tables."""
+    """Simple UI to add repos to a personal watchlist. Requires signing in
+    with a username first, which provisions that student's own Lakebase
+    schema/tables."""
     username = _current_username()
     if not username:
         return redirect(url_for("login"))
@@ -258,30 +250,6 @@ def logout():
     if request.is_json:
         return jsonify({"status": "ok"})
     return redirect(url_for("login"))
-
-
-@app.route("/insights")
-def list_insights():
-    """
-    Read the Spark-processed, per-repo/per-language insights table. This
-    table is READ-ONLY in Postgres - it is kept in sync from Unity Catalog
-    by a Databricks Synced Table, not written to by this app.
-    """
-    language = request.args.get("language")
-    limit = int(request.args.get("limit", 100))
-
-    if language:
-        rows = lakebase.run_query(
-            f"SELECT * FROM {INSIGHTS_TABLE_NAME} WHERE language = %s "
-            f"ORDER BY rank_in_language ASC LIMIT %s",
-            (language, limit),
-        )
-    else:
-        rows = lakebase.run_query(
-            f"SELECT * FROM {INSIGHTS_TABLE_NAME} ORDER BY stargazers_count DESC LIMIT %s",
-            (limit,),
-        )
-    return jsonify(rows)
 
 
 @app.route("/watchlist", methods=["GET"])
