@@ -131,11 +131,9 @@ def ensure_student_schema(username: str, email: str):
                     """
                 ).format(schema_ident)
             )
-            # Reassigning ownership requires the connecting role to be a
-            # member of the target role (or a superuser) - grant it first,
-            # idempotently, then hand over ownership of the schema and both
-            # tables to the student's own Postgres role.
-            cur.execute(sql.SQL("GRANT {} TO CURRENT_USER").format(owner_ident))
+            # Reassign ownership of the schema and both tables to the
+            # student's own Postgres role so they can run owner-only DDL
+            # (e.g. ALTER TABLE ... REPLICA IDENTITY ...).
             cur.execute(sql.SQL("ALTER SCHEMA {} OWNER TO {}").format(schema_ident, owner_ident))
             cur.execute(
                 sql.SQL("ALTER TABLE {}.github_repos OWNER TO {}").format(schema_ident, owner_ident)
