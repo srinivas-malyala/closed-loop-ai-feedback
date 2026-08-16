@@ -317,7 +317,6 @@ def get_graph_edges():
     if not username:
         return jsonify({"error": "Not signed in"}), 401
 
-    schema = _schema_for(username)
     edge_type = request.args.get("edge_type")
     source = request.args.get("source")
     target = request.args.get("target")
@@ -342,7 +341,7 @@ def get_graph_edges():
     try:
         rows = lakebase.run_query(
             f"SELECT source, target, edge_type, metadata, discovered_at "
-            f"FROM {schema}.uc_github_graph_edges"
+            f"FROM {username}.uc_github_graph_edges"
             f"{where_clause} ORDER BY discovered_at DESC LIMIT %s",
             tuple(params),
         )
@@ -361,12 +360,10 @@ def get_graph_stats():
     if not username:
         return jsonify({"error": "Not signed in"}), 401
 
-    schema = _schema_for(username)
-
     try:
         rows = lakebase.run_query(
             f"SELECT edge_type, COUNT(*) as count "
-            f"FROM {schema}.uc_github_graph_edges "
+            f"FROM {username}.uc_github_graph_edges "
             f"GROUP BY edge_type ORDER BY count DESC"
         )
     except Exception as exc:
