@@ -3,19 +3,23 @@ Client for the GitHub REST API.
 
 The GitHub personal access token (PAT) is OPTIONAL. Unauthenticated requests
 work but are capped at 60 requests/hour; a PAT raises that to 5,000/hour.
-When present, the token is stored in a Databricks secret scope (see
-setup_secrets.py) and resolved at runtime via the Databricks SDK - it is
-never stored in code, env files, or app.yaml.
+When present, the token is stored in a Databricks secret scope and resolved
+at runtime via dbutils.secrets.get() - it is never stored in code, env files,
+or app.yaml.
+
+Usage:
+    # On the driver (token auto-resolved from secrets):
+    client = GitHubClient()
+
+    # On executors (pass token explicitly via broadcast):
+    token = dbutils.secrets.get(scope="github", key="token")
+    client = GitHubClient(token=token)
 """
 
-import base64
 import os
 from typing import Any, Iterator
 
 import requests
-from databricks.sdk import WorkspaceClient
-
-_w = WorkspaceClient()
 
 _SCOPE = os.environ.get("GITHUB_SECRET_SCOPE", "github")
 _KEY = os.environ.get("GITHUB_SECRET_KEY", "token")
@@ -24,23 +28,42 @@ _BASE_URL = os.environ.get("GITHUB_API_BASE_URL", "https://api.github.com")
 _DEFAULT_TIMEOUT = 30
 
 
-def _get_token() -> str | None:
-    """Fetch and decode the GitHub PAT from the Databricks secret scope.
+def _get_token_from_secrets() -> str | None:
+    """Fetch the GitHub PAT from the Databricks secret scope using dbutils.
 
-    Returns None (falls back to unauthenticated requests) if the scope/key
-    doesn't exist - a token is a nice-to-have, not a hard requirement.
+    Returns None (falls back to unauthenticated requests) if dbutils is
+    unavailable or the scope/key doesn't exist.
     """
     try:
-        secret = _w.secrets.get_secret(scope=_SCOPE, key=_KEY)
-        return base64.b64decode(secret.value).decode("utf-8")
+        from pyspark.dbutils import DBUtils
+        from pyspark.sql import SparkSession
+
+        spark = SparkSession.getActiveSession()
+        if spark is None:
+            return None
+        dbutils = DBUtils(spark)
+        return dbutils.secrets.get(scope=_SCOPE, key=_KEY)
     except Exception:
         return None
 
 
 class GitHubClient:
-    """Thin wrapper around the GitHub REST API with optional auth."""
+    """Thin wrapper around the GitHub REST API with optional auth.
 
-    def __init__(self, base_url: str | None = None, timeout: int = _DEFAULT_TIMEOUT):
+    Args:
+        token: Explicit GitHub PAT. If None, auto-resolves from Databricks
+            secrets. Pass explicitly when running on executors (broadcast
+            the token from the driver).
+        base_url: GitHub API base URL (default: https://api.github.com).
+        timeout: Request timeout in seconds.
+    """
+
+    def __init__(
+        self,
+        token: str | None = None,
+        base_url: str | None = None,
+        timeout: int = _DEFAULT_TIMEOUT,
+    ):
         self.base_url = (base_url or _BASE_URL).rstrip("/")
         self.timeout = timeout
         self._session = requests.Session()
@@ -48,9 +71,10 @@ class GitHubClient:
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        token = _get_token()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
+        # Use explicit token, or fall back to secrets lookup
+        resolved_token = token if token is not None else _get_token_from_secrets()
+        if resolved_token:
+            headers["Authorization"] = f"Bearer {resolved_token}"
         self._session.headers.update(headers)
 
     def get(self, path: str, params: dict[str, Any] | None = None) -> Any:

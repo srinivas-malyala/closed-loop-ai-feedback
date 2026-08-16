@@ -126,12 +126,12 @@ def fetch_all_for_repo(repo_iter):
     # Add the project path for GitHubClient import on executors
     import sys
     sys.path.insert(0, "/Workspace/Users/{}/ltap-lab-day-1".format(
-        # This will be replaced by broadcast variable
         _workspace_user.value
     ))
     from github_client import GitHubClient
 
-    client = GitHubClient()
+    # Use broadcast token - dbutils.secrets isn't available on executors
+    client = GitHubClient(token=_github_token.value)
 
     for repo in repo_iter:
         full_name = repo["full_name"]
@@ -233,6 +233,12 @@ def fetch_all_for_repo(repo_iter):
 # Broadcast the workspace username so executors can find the project path
 _workspace_user = sc.broadcast(
     dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
+)
+
+# Broadcast the GitHub token so executors can authenticate API calls
+# (dbutils.secrets is only available on the driver, not on executors)
+_github_token = sc.broadcast(
+    dbutils.secrets.get(scope="github", key="token")
 )
 
 # Execute on the cluster - this runs fetch_all_for_repo across executors
