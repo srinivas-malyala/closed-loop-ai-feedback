@@ -25,6 +25,7 @@ student_username = dbutils.widgets.get("student_username")
 files_bronze_table = f"{catalog}.{schema}.github_repo_files_bronze"
 commits_bronze_table = f"{catalog}.{schema}.github_repo_commits_bronze"
 ai_insights_gold_table = f"{catalog}.{schema}.github_repo_ai_insights_gold"
+file_contents_bronze_table = f"{catalog}.{schema}.github_file_contents_bronze"
 
 # Lakebase source
 lakebase_schema = f"student_{student_username}"
@@ -33,6 +34,7 @@ print(f"Catalog: {catalog}")
 print(f"Schema: {schema}")
 print(f"Lakebase schema: {lakebase_schema}")
 print(f"Files bronze: {files_bronze_table}")
+print(f"File contents bronze: {file_contents_bronze_table}")
 print(f"Commits bronze: {commits_bronze_table}")
 print(f"AI insights gold: {ai_insights_gold_table}")
 
@@ -94,6 +96,85 @@ for repo in repos:
         print(f"  ✗ Error fetching tree for {full_name}: {e}")
 
 print(f"\nTotal file entries collected: {len(all_files)}")
+
+# COMMAND ----------
+
+# DBTITLE 1,Fetch file contents for all repos
+import base64
+
+# File extensions we consider "text" and worth fetching content for
+TEXT_EXTENSIONS = {
+    "py", "js", "ts", "tsx", "jsx", "java", "scala", "go", "rs", "rb", "php",
+    "c", "cpp", "h", "hpp", "cs", "swift", "kt", "r", "jl", "lua", "sh",
+    "bash", "zsh", "fish", "sql", "graphql", "proto",
+    "html", "htm", "css", "scss", "sass", "less",
+    "json", "yaml", "yml", "toml", "xml", "ini", "cfg", "conf",
+    "md", "rst", "txt", "csv", "tsv",
+    "dockerfile", "makefile", "cmake",
+    "tf", "hcl", "nix", "dhall",
+    "gitignore", "env", "editorconfig",
+}
+
+# Max file size to fetch (100KB) - skip large generated/vendored files
+MAX_CONTENT_SIZE = 100_000
+
+all_file_contents = []
+
+for repo in repos:
+    full_name = repo["full_name"]
+    repo_meta = client.get_repo(full_name)
+    default_branch = repo_meta.get("default_branch", "main")
+
+    # Filter to text files under size limit
+    repo_files = [
+        f for f in all_files
+        if f["repo_full_name"] == full_name
+        and f["type"] == "blob"
+        and (f.get("size") or 0) <= MAX_CONTENT_SIZE
+        and (f["path"].rsplit(".", 1)[-1].lower() if "." in f["path"]
+             else f["path"].rsplit("/", 1)[-1].lower()) in TEXT_EXTENSIONS
+    ]
+
+    print(f"Fetching contents for {full_name}: {len(repo_files)} text files...")
+    fetched = 0
+    errors = 0
+
+    for file_entry in repo_files:
+        file_path = file_entry["path"]
+        try:
+            content_data = client.get_file_content(full_name, file_path, ref=default_branch)
+
+            # Decode base64 content
+            raw_content = content_data.get("content", "")
+            encoding = content_data.get("encoding", "base64")
+            if encoding == "base64" and raw_content:
+                decoded = base64.b64decode(raw_content).decode("utf-8", errors="replace")
+            else:
+                decoded = raw_content
+
+            # Detect language from extension
+            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+
+            all_file_contents.append({
+                "repo_full_name": full_name,
+                "path": file_path,
+                "content": decoded[:500_000],  # Safety cap at 500KB decoded
+                "encoding": encoding,
+                "sha": content_data.get("sha"),
+                "size": content_data.get("size"),
+                "language": ext,
+                "ingested_at": datetime.utcnow().isoformat(),
+            })
+            fetched += 1
+
+        except Exception as e:
+            errors += 1
+            if errors <= 3:
+                print(f"    ✗ {file_path}: {e}")
+
+    print(f"  → Fetched {fetched} files ({errors} errors)")
+
+print(f"\nTotal file contents collected: {len(all_file_contents)}")
 
 # COMMAND ----------
 
@@ -166,6 +247,35 @@ if all_files:
     display(files_df.groupBy("repo_full_name").count().orderBy("count", ascending=False))
 else:
     print("No file data to write.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Write file contents to bronze Delta table
+file_contents_schema = StructType([
+    StructField("repo_full_name", StringType(), False),
+    StructField("path", StringType(), False),
+    StructField("content", StringType(), True),
+    StructField("encoding", StringType(), True),
+    StructField("sha", StringType(), True),
+    StructField("size", LongType(), True),
+    StructField("language", StringType(), True),
+    StructField("ingested_at", StringType(), True),
+])
+
+if all_file_contents:
+    contents_df = spark.createDataFrame(all_file_contents, schema=file_contents_schema)
+    contents_df = contents_df.withColumn("ingested_at", F.to_timestamp("ingested_at"))
+
+    (
+        contents_df.write.format("delta")
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(file_contents_bronze_table)
+    )
+    print(f"✓ Wrote {contents_df.count()} file contents to {file_contents_bronze_table}")
+    display(contents_df.groupBy("repo_full_name").count().orderBy("count", ascending=False))
+else:
+    print("No file content data to write.")
 
 # COMMAND ----------
 
@@ -297,8 +407,8 @@ if not favorite_repos:
     dbutils.notebook.exit("No favorites to AI-process. Stats written to bronze tables.")
 
 
-def build_ai_prompt(full_name: str, files: list[dict], commits: list[dict]) -> str:
-    """Build a structured prompt for the AI model from repo files and commits."""
+def build_ai_prompt(full_name: str, files: list[dict], commits: list[dict], file_contents: list[dict]) -> str:
+    """Build a structured prompt for the AI model from repo files, commits, and contents."""
 
     # Summarize file tree (top-level structure + extensions)
     file_paths = [f["path"] for f in files if f.get("type") == "blob"]
@@ -317,6 +427,47 @@ def build_ai_prompt(full_name: str, files: list[dict], commits: list[dict]) -> s
     # Unique authors
     authors = list(set(c.get("author_name", "Unknown") for c in commits if c.get("author_name")))[:20]
 
+    # Key file contents - prioritize config/entry files, limit total size
+    key_files = []
+    priority_patterns = [
+        "README", "setup.py", "pyproject.toml", "package.json", "Cargo.toml",
+        "go.mod", "build.gradle", "pom.xml", "Makefile", "Dockerfile",
+        "requirements.txt", "setup.cfg", "app.py", "main.py", "index.ts",
+        "index.js", "lib.rs", "mod.rs",
+    ]
+
+    # Sort contents: priority files first, then by path
+    def file_priority(fc):
+        name = fc["path"].rsplit("/", 1)[-1]
+        for i, pat in enumerate(priority_patterns):
+            if pat.lower() in name.lower():
+                return i
+        return len(priority_patterns)
+
+    sorted_contents = sorted(file_contents, key=file_priority)
+
+    # Include up to ~30KB of file content in the prompt
+    content_budget = 30_000
+    content_used = 0
+    for fc in sorted_contents:
+        content = fc.get("content", "")
+        if not content:
+            continue
+        # Truncate individual files to 5KB
+        truncated = content[:5000]
+        if content_used + len(truncated) > content_budget:
+            break
+        key_files.append(f"### {fc['path']}\n```\n{truncated}\n```")
+        content_used += len(truncated)
+
+    file_contents_section = ""
+    if key_files:
+        file_contents_section = f"""
+
+## Key File Contents ({len(key_files)} files)
+{chr(10).join(key_files)}
+"""
+
     prompt = f"""Analyze this GitHub repository: {full_name}
 
 ## File Structure
@@ -325,7 +476,7 @@ Top-level entries: {', '.join(top_level)}
 
 File extensions (count):
 {chr(10).join(f'  .{ext}: {count}' for ext, count in top_extensions)}
-
+{file_contents_section}
 ## Commit History
 Total commits (up to 200): {len(commits)}
 Unique authors: {', '.join(authors[:10])}
@@ -334,13 +485,14 @@ Recent commit messages:
 {chr(10).join(f'  - {msg.split(chr(10))[0]}' for msg in recent_messages)}
 
 ## Task
-Based on this information, provide a JSON response with:
+Based on this information (including the actual file contents), provide a JSON response with:
 1. "purpose": A 2-3 sentence summary of what this repository does
 2. "tech_stack": List of key technologies/frameworks/languages used
 3. "commit_patterns": Brief analysis of commit activity and collaboration patterns
 4. "strengths": 2-3 notable strengths of the project
 5. "health_score": Integer 0-100 rating the project health (activity, maintenance, structure)
 6. "health_rationale": One sentence explaining the health score
+7. "code_quality_notes": 2-3 observations about code quality from the actual source
 
 Respond ONLY with valid JSON, no markdown formatting."""
 
@@ -378,14 +530,15 @@ for repo in favorite_repos:
     full_name = repo["full_name"]
     print(f"\n🤖 AI-processing: {full_name}")
 
-    # Get files and commits for this repo
+    # Get files, commits, and contents for this repo
     repo_files = [f for f in all_files if f["repo_full_name"] == full_name]
     repo_commits = [c for c in all_commits if c["repo_full_name"] == full_name]
+    repo_contents = [f for f in all_file_contents if f["repo_full_name"] == full_name]
 
-    print(f"   Files: {len(repo_files)}, Commits: {len(repo_commits)}")
+    print(f"   Files: {len(repo_files)}, Commits: {len(repo_commits)}, Contents: {len(repo_contents)}")
 
     try:
-        prompt = build_ai_prompt(full_name, repo_files, repo_commits)
+        prompt = build_ai_prompt(full_name, repo_files, repo_commits, repo_contents)
         insights = call_foundation_model(prompt)
 
         ai_insights.append({
@@ -396,6 +549,7 @@ for repo in favorite_repos:
             "strengths": json.dumps(insights.get("strengths", [])),
             "health_score": int(insights.get("health_score", 0)),
             "health_rationale": insights.get("health_rationale", ""),
+            "code_quality_notes": json.dumps(insights.get("code_quality_notes", [])),
             "processed_at": datetime.utcnow().isoformat(),
         })
         print(f"   ✓ Health score: {insights.get('health_score')}/100")
@@ -411,6 +565,7 @@ for repo in favorite_repos:
             "strengths": "[]",
             "health_score": -1,
             "health_rationale": "Processing error",
+            "code_quality_notes": "[]",
             "processed_at": datetime.utcnow().isoformat(),
         })
 
@@ -429,6 +584,7 @@ ai_insights_schema = StructType([
     StructField("strengths", StringType(), True),
     StructField("health_score", IntegerType(), True),
     StructField("health_rationale", StringType(), True),
+    StructField("code_quality_notes", StringType(), True),
     StructField("processed_at", StringType(), True),
 ])
 
@@ -455,6 +611,8 @@ print("DAY 2 PROCESSING COMPLETE")
 print("=" * 60)
 print(f"\n📁 Files bronze:      {files_bronze_table}")
 print(f"   → {len(all_files)} file entries across {len(repos)} repos")
+print(f"\n📄 File contents:     {file_contents_bronze_table}")
+print(f"   → {len(all_file_contents)} files with content fetched")
 print(f"\n📝 Commits bronze:    {commits_bronze_table}")
 print(f"   → {len(all_commits)} commits across {len(repos)} repos")
 print(f"\n🤖 AI insights gold:  {ai_insights_gold_table}")

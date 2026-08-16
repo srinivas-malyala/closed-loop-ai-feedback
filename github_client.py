@@ -139,6 +139,23 @@ class GitHubClient:
             page += 1
         return commits
 
+    def get_file_content(self, full_name: str, path: str, ref: str | None = None) -> dict:
+        """
+        Fetch a single file's content via the GitHub Contents API.
+        Returns the raw JSON including 'content' (base64-encoded), 'encoding',
+        'size', 'name', 'path', and 'sha'.
+
+        Note: Only works for files up to 1MB. Larger files return a download_url
+        instead of inline content.
+
+        Args:
+            full_name: "owner/repo" string.
+            path: File path within the repo (e.g. "src/main.py").
+            ref: Optional branch/tag/SHA (defaults to repo's default branch).
+        """
+        params = {"ref": ref} if ref else None
+        return self.get(f"/repos/{full_name}/contents/{path}", params=params)
+
     def get_repo_tree(self, full_name: str, ref: str, recursive: bool = True) -> dict:
         """
         Fetch the full file tree for a repository in ONE API call via the Git
