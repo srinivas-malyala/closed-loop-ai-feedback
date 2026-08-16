@@ -102,159 +102,252 @@ API_DELAY_SECONDS = 0.1
 
 # COMMAND ----------
 
-# DBTITLE 1,Fetch file trees + contents + commits (distributed on executors)
+# DBTITLE 1,Fetch file trees + contents + commits (distributed on executors via mapInPandas)
+import pandas as pd
+from pyspark.sql import functions as F
 
-# Distribute repos across executors - one partition per repo for isolation
-# This ensures each executor handles one repo's full API interaction
-num_repos = len(repos)
-repos_rdd = sc.parallelize(repos, numSlices=min(num_repos, 8))
+# Store credentials in Spark conf so executors can access them
+# (Serverless doesn't support sc.broadcast or RDDs)
+_workspace_user = dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
+_github_token = dbutils.secrets.get(scope="github", key="token")
+
+spark.conf.set("spark.custom.github_token", _github_token)
+spark.conf.set("spark.custom.workspace_user", _workspace_user)
+
+# Create a DataFrame of repos and repartition for parallelism
+repos_input_df = spark.createDataFrame(
+    [(r["full_name"],) for r in repos],
+    schema=["full_name"]
+).repartition(min(len(repos), 8))
+
+# Output schema for the mapInPandas function - flat schema with a category column
+# to distinguish file tree entries, file contents, and commits
+output_schema = """
+    category STRING,
+    repo_full_name STRING,
+    path STRING,
+    file_type STRING,
+    sha STRING,
+    size LONG,
+    mode STRING,
+    tree_truncated BOOLEAN,
+    content STRING,
+    encoding STRING,
+    language STRING,
+    author_name STRING,
+    author_email STRING,
+    author_date STRING,
+    committer_name STRING,
+    committer_email STRING,
+    committer_date STRING,
+    message STRING,
+    additions LONG,
+    deletions LONG,
+    ingested_at STRING
+"""
 
 
-def fetch_all_for_repo(repo_iter):
+def fetch_all_for_repos(iterator):
     """
-    Executor-side function: for each repo in this partition, fetch the
-    file tree, file contents (text files only), and commits.
+    mapInPandas function: receives an iterator of pandas DataFrames (each with
+    a 'full_name' column), fetches GitHub data on the executor, yields result
+    DataFrames.
 
-    Yields (category, dict) tuples where category is 'file', 'content', or 'commit'.
-    A fresh GitHubClient is instantiated per partition (Sessions aren't serializable).
+    Compatible with Databricks Serverless (no RDDs, no broadcast variables).
     """
-    # Import inside executor - these modules must be available on workers
     import base64
     import time
-    from datetime import datetime
-
-    # Add the project path for GitHubClient import on executors
     import sys
-    sys.path.insert(0, "/Workspace/Users/{}/ltap-lab-day-1".format(
-        _workspace_user.value
-    ))
+    from datetime import datetime
+    from pyspark.sql import SparkSession
+
+    # Get Spark conf values (set on driver, readable on executors)
+    spark_session = SparkSession.getActiveSession()
+    token = spark_session.conf.get("spark.custom.github_token")
+    workspace_user = spark_session.conf.get("spark.custom.workspace_user")
+
+    sys.path.insert(0, f"/Workspace/Users/{workspace_user}/ltap-lab-day-1")
     from github_client import GitHubClient
 
-    # Use broadcast token - dbutils.secrets isn't available on executors
-    client = GitHubClient(token=_github_token.value)
+    client = GitHubClient(token=token)
 
-    for repo in repo_iter:
-        full_name = repo["full_name"]
+    for pdf in iterator:
+        rows = []
 
-        # --- 1. Fetch file tree ---
-        try:
-            repo_meta = client.get_repo(full_name)
-            time.sleep(API_DELAY_SECONDS)
-            default_branch = repo_meta.get("default_branch", "main")
+        for full_name in pdf["full_name"].tolist():
+            # --- 1. Fetch file tree ---
+            try:
+                repo_meta = client.get_repo(full_name)
+                time.sleep(API_DELAY_SECONDS)
+                default_branch = repo_meta.get("default_branch", "main")
 
-            tree_data = client.get_repo_tree(full_name, ref=default_branch)
-            time.sleep(API_DELAY_SECONDS)
+                tree_data = client.get_repo_tree(full_name, ref=default_branch)
+                time.sleep(API_DELAY_SECONDS)
 
-            tree_entries = tree_data.get("tree", [])
-            truncated = tree_data.get("truncated", False)
-            ingested_at = datetime.utcnow().isoformat()
+                tree_entries = tree_data.get("tree", [])
+                truncated = tree_data.get("truncated", False)
+                ingested_at = datetime.utcnow().isoformat()
 
-            for entry in tree_entries:
-                yield ("file", {
-                    "repo_full_name": full_name,
-                    "path": entry.get("path"),
-                    "type": entry.get("type"),
-                    "sha": entry.get("sha"),
-                    "size": entry.get("size"),
-                    "mode": entry.get("mode"),
-                    "tree_truncated": truncated,
-                    "ingested_at": ingested_at,
-                })
-
-            # --- 2. Fetch file contents for text files under size limit ---
-            text_files = [
-                e for e in tree_entries
-                if e.get("type") == "blob"
-                and (e.get("size") or 0) <= MAX_CONTENT_SIZE
-                and (e["path"].rsplit(".", 1)[-1].lower() if "." in e["path"]
-                     else e["path"].rsplit("/", 1)[-1].lower()) in TEXT_EXTENSIONS
-            ]
-
-            for file_entry in text_files:
-                file_path = file_entry["path"]
-                try:
-                    content_data = client.get_file_content(full_name, file_path, ref=default_branch)
-                    time.sleep(API_DELAY_SECONDS)
-
-                    raw_content = content_data.get("content", "")
-                    encoding = content_data.get("encoding", "base64")
-                    if encoding == "base64" and raw_content:
-                        decoded = base64.b64decode(raw_content).decode("utf-8", errors="replace")
-                    else:
-                        decoded = raw_content
-
-                    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-
-                    yield ("content", {
+                for entry in tree_entries:
+                    rows.append({
+                        "category": "file",
                         "repo_full_name": full_name,
-                        "path": file_path,
-                        "content": decoded[:500_000],
-                        "encoding": encoding,
-                        "sha": content_data.get("sha"),
-                        "size": content_data.get("size"),
-                        "language": ext,
+                        "path": entry.get("path"),
+                        "file_type": entry.get("type"),
+                        "sha": entry.get("sha"),
+                        "size": entry.get("size"),
+                        "mode": entry.get("mode"),
+                        "tree_truncated": truncated,
+                        "content": None,
+                        "encoding": None,
+                        "language": None,
+                        "author_name": None,
+                        "author_email": None,
+                        "author_date": None,
+                        "committer_name": None,
+                        "committer_email": None,
+                        "committer_date": None,
+                        "message": None,
+                        "additions": None,
+                        "deletions": None,
+                        "ingested_at": ingested_at,
+                    })
+
+                # --- 2. Fetch file contents for text files ---
+                text_files = [
+                    e for e in tree_entries
+                    if e.get("type") == "blob"
+                    and (e.get("size") or 0) <= MAX_CONTENT_SIZE
+                    and (e["path"].rsplit(".", 1)[-1].lower() if "." in e["path"]
+                         else e["path"].rsplit("/", 1)[-1].lower()) in TEXT_EXTENSIONS
+                ]
+
+                for file_entry in text_files:
+                    file_path = file_entry["path"]
+                    try:
+                        content_data = client.get_file_content(full_name, file_path, ref=default_branch)
+                        time.sleep(API_DELAY_SECONDS)
+
+                        raw_content = content_data.get("content", "")
+                        enc = content_data.get("encoding", "base64")
+                        if enc == "base64" and raw_content:
+                            decoded = base64.b64decode(raw_content).decode("utf-8", errors="replace")
+                        else:
+                            decoded = raw_content
+
+                        ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+
+                        rows.append({
+                            "category": "content",
+                            "repo_full_name": full_name,
+                            "path": file_path,
+                            "file_type": None,
+                            "sha": content_data.get("sha"),
+                            "size": content_data.get("size"),
+                            "mode": None,
+                            "tree_truncated": None,
+                            "content": decoded[:500_000],
+                            "encoding": enc,
+                            "language": ext,
+                            "author_name": None,
+                            "author_email": None,
+                            "author_date": None,
+                            "committer_name": None,
+                            "committer_email": None,
+                            "committer_date": None,
+                            "message": None,
+                            "additions": None,
+                            "deletions": None,
+                            "ingested_at": datetime.utcnow().isoformat(),
+                        })
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass  # Skip repos where tree fetch fails
+
+            # --- 3. Fetch commits ---
+            try:
+                commits = client.get_commits(full_name, max_results=200)
+                time.sleep(API_DELAY_SECONDS)
+
+                for c in commits:
+                    commit_data = c.get("commit", {})
+                    author = commit_data.get("author", {}) or {}
+                    committer = commit_data.get("committer", {}) or {}
+                    stats = c.get("stats", {}) or {}
+
+                    rows.append({
+                        "category": "commit",
+                        "repo_full_name": full_name,
+                        "path": None,
+                        "file_type": None,
+                        "sha": c.get("sha"),
+                        "size": None,
+                        "mode": None,
+                        "tree_truncated": None,
+                        "content": None,
+                        "encoding": None,
+                        "language": None,
+                        "author_name": author.get("name"),
+                        "author_email": author.get("email"),
+                        "author_date": author.get("date"),
+                        "committer_name": committer.get("name"),
+                        "committer_email": committer.get("email"),
+                        "committer_date": committer.get("date"),
+                        "message": commit_data.get("message", "")[:1000],
+                        "additions": stats.get("additions"),
+                        "deletions": stats.get("deletions"),
                         "ingested_at": datetime.utcnow().isoformat(),
                     })
-                except Exception:
-                    pass  # Skip files that fail (permissions, too large, etc.)
+            except Exception:
+                pass
 
-        except Exception:
-            pass  # Skip repos where tree fetch fails entirely
-
-        # --- 3. Fetch commits ---
-        try:
-            commits = client.get_commits(full_name, max_results=200)
-            time.sleep(API_DELAY_SECONDS)
-
-            for c in commits:
-                commit_data = c.get("commit", {})
-                author = commit_data.get("author", {}) or {}
-                committer = commit_data.get("committer", {}) or {}
-                stats = c.get("stats", {}) or {}
-
-                yield ("commit", {
-                    "repo_full_name": full_name,
-                    "sha": c.get("sha"),
-                    "author_name": author.get("name"),
-                    "author_email": author.get("email"),
-                    "author_date": author.get("date"),
-                    "committer_name": committer.get("name"),
-                    "committer_email": committer.get("email"),
-                    "committer_date": committer.get("date"),
-                    "message": commit_data.get("message", "")[:1000],
-                    "additions": stats.get("additions"),
-                    "deletions": stats.get("deletions"),
-                    "ingested_at": datetime.utcnow().isoformat(),
-                })
-        except Exception:
-            pass  # Skip repos where commit fetch fails
+        # Yield a pandas DataFrame for this partition
+        if rows:
+            yield pd.DataFrame(rows)
+        else:
+            # Must yield an empty DataFrame with correct columns
+            yield pd.DataFrame(columns=[
+                "category", "repo_full_name", "path", "file_type", "sha", "size",
+                "mode", "tree_truncated", "content", "encoding", "language",
+                "author_name", "author_email", "author_date", "committer_name",
+                "committer_email", "committer_date", "message", "additions",
+                "deletions", "ingested_at",
+            ])
 
 
-# Broadcast the workspace username so executors can find the project path
-_workspace_user = sc.broadcast(
-    dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
-)
+# Execute distributed fetching using mapInPandas (Serverless-compatible)
+print(f"Distributing GitHub API fetching across executors for {len(repos)} repos...")
+results_df = repos_input_df.mapInPandas(fetch_all_for_repos, schema=output_schema)
 
-# Broadcast the GitHub token so executors can authenticate API calls
-# (dbutils.secrets is only available on the driver, not on executors)
-_github_token = sc.broadcast(
-    dbutils.secrets.get(scope="github", key="token")
-)
+# Cache the results so we can filter by category without re-executing
+results_df.cache()
+results_df.count()  # Force materialization
 
-# Execute on the cluster - this runs fetch_all_for_repo across executors
-print(f"Distributing GitHub API fetching across executors for {num_repos} repos...")
-results_rdd = repos_rdd.flatMap(lambda repo: fetch_all_for_repo(iter([repo])))
+# Split into separate collections by category
+all_files = [
+    row.asDict() for row in
+    results_df.filter("category = 'file'")
+    .select("repo_full_name", "path", F.col("file_type").alias("type"), "sha", "size", "mode", "tree_truncated", "ingested_at")
+    .collect()
+]
+all_file_contents = [
+    row.asDict() for row in
+    results_df.filter("category = 'content'")
+    .select("repo_full_name", "path", "content", "encoding", "sha", "size", "language", "ingested_at")
+    .collect()
+]
+all_commits = [
+    row.asDict() for row in
+    results_df.filter("category = 'commit'")
+    .select("repo_full_name", "sha", "author_name", "author_email", "author_date",
+            "committer_name", "committer_email", "committer_date", "message",
+            "additions", "deletions", "ingested_at")
+    .collect()
+]
 
-# Cache to avoid re-fetching when we separate by category
-results_rdd.cache()
-
-# Separate results by category
-all_files = [r[1] for r in results_rdd.filter(lambda x: x[0] == "file").collect()]
-all_file_contents = [r[1] for r in results_rdd.filter(lambda x: x[0] == "content").collect()]
-all_commits = [r[1] for r in results_rdd.filter(lambda x: x[0] == "commit").collect()]
-
-# Unpersist after collection
-results_rdd.unpersist()
+results_df.unpersist()
 
 print(f"✓ File tree entries: {len(all_files)}")
 print(f"✓ File contents fetched: {len(all_file_contents)}")
@@ -263,8 +356,6 @@ print(f"✓ Commits fetched: {len(all_commits)}")
 # COMMAND ----------
 
 # DBTITLE 1,Write files to bronze Delta table
-from pyspark.sql import functions as F
-
 files_schema = StructType([
     StructField("repo_full_name", StringType(), False),
     StructField("path", StringType(), True),
