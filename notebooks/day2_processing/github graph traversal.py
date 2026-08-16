@@ -30,6 +30,12 @@ FETCH_MODE = dbutils.widgets.get("fetch_mode")  # "graphql" or "rest"
 
 repos_history_table = f"{catalog}.{schema}.lb_github_repos_history"
 github_staging_table = f"{catalog}.{schema}.github_api_staging"
+graph_edges_table = f"{catalog}.{schema}.github_graph_edges"
+
+# Budget: GitHub REST API = 5000 req/hr. Track usage to avoid blowing the limit.
+# Each repo fetch costs ~2 calls (graphql) or ~5-7 (rest). Reserve some for discovery.
+MAX_GITHUB_REQUESTS_PER_RUN = 4000  # Leave headroom
+_github_request_count = 0
 
 DEPENDENCY_FILENAMES = {
     "package.json", "requirements.txt", "setup.py", "pyproject.toml",
@@ -599,6 +605,187 @@ def discover_committer_repos(committer_usernames, already_seen, client):
     return discovered
 
 
+# =============================================================================
+# Graph edge tracking: records HOW repos/committers are connected
+# =============================================================================
+
+_graph_edges = []  # Accumulate edges during traversal, write at the end
+
+
+def record_edge(source, target, edge_type, metadata=None):
+    """Record a graph edge (repo->repo, committer->repo, dependency->repo)."""
+    _graph_edges.append({
+        "source": source,
+        "target": target,
+        "edge_type": edge_type,  # "committer", "dependency", "ai_suggested"
+        "metadata": json.dumps(metadata) if metadata else None,
+        "discovered_at": datetime.utcnow().isoformat(),
+    })
+
+
+def write_graph_edges():
+    """Write all accumulated graph edges to a Delta table."""
+    if not _graph_edges:
+        return
+    edges_schema = StructType([
+        StructField("source", StringType(), False),
+        StructField("target", StringType(), False),
+        StructField("edge_type", StringType(), False),
+        StructField("metadata", StringType(), True),
+        StructField("discovered_at", StringType(), False),
+    ])
+    edges_df = spark.createDataFrame(_graph_edges, schema=edges_schema)
+    (
+        edges_df.write.format("delta")
+        .mode("append")
+        .option("mergeSchema", "true")
+        .saveAsTable(graph_edges_table)
+    )
+    print(f"  ✓ Wrote {len(_graph_edges)} graph edges to {graph_edges_table}")
+
+
+# =============================================================================
+# AI-powered repo discovery from dependency files
+# Uses ai_query to analyze dependency contents and suggest real owner/repo names
+# =============================================================================
+
+_AI_DEPENDENCY_PROMPT = """You are analyzing dependency files from GitHub repository "{source_repo}".
+Below are the contents of its dependency/manifest files.
+
+{dep_contents}
+
+Based on these dependencies, suggest up to 10 specific GitHub repositories (as "owner/repo" format)
+that are:
+1. Direct dependencies visible in the files above (e.g., if package.json lists "express", suggest "expressjs/express")
+2. Key upstream libraries this project depends on
+
+Rules:
+- ONLY suggest repos you are confident exist on GitHub in "owner/repo" format
+- Focus on the most significant/popular dependencies, skip trivial ones (e.g., skip type stubs, tiny utils)
+- Do NOT suggest the source repo itself
+- Respond ONLY with a JSON array of strings, e.g.: ["owner/repo1", "owner/repo2"]
+- If you cannot determine any repos, respond with: []"""
+
+
+def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
+    """
+    Use ai_query to analyze dependency files and discover related repos.
+    
+    Strategy:
+    1. Read dependency file contents from staging
+    2. Group by source repo, batch into AI prompts
+    3. AI suggests specific owner/repo names
+    4. Validate suggestions exist via GitHub API (1 call each, but only for new repos)
+    
+    Rate-limit aware: validates at most 50 suggestions per hop to conserve API budget.
+    """
+    global _github_request_count
+
+    # Get repos that have dependency content in staging
+    dep_contents_df = staging_df.filter(
+        "category = 'content' AND path IN ('package.json', 'requirements.txt', 'setup.py', "
+        "'pyproject.toml', 'Cargo.toml', 'go.mod', 'build.gradle', 'pom.xml', "
+        "'Gemfile', 'composer.json', 'setup.cfg', 'Pipfile')"
+    ).select("repo_full_name", "path", "content")
+
+    # Collect and group by repo (limit to avoid massive AI prompts)
+    dep_rows = dep_contents_df.collect()
+    if not dep_rows:
+        print("    No dependency files found in staging for AI analysis")
+        return []
+
+    # Group contents by source repo
+    repo_deps = {}
+    for row in dep_rows:
+        repo = row["repo_full_name"]
+        if repo not in repo_deps:
+            repo_deps[repo] = []
+        # Truncate each file to 3KB to keep prompts manageable
+        content = (row["content"] or "")[:3000]
+        if content:
+            repo_deps[repo].append(f"### {row['path']}\n```\n{content}\n```")
+
+    # Process up to 10 repos per hop to control AI cost
+    ai_suggestions = []
+    repos_to_analyze = list(repo_deps.items())[:10]
+
+    for source_repo, dep_files in repos_to_analyze:
+        dep_contents_text = "\n\n".join(dep_files)
+        prompt = _AI_DEPENDENCY_PROMPT.format(
+            source_repo=source_repo,
+            dep_contents=dep_contents_text
+        )
+
+        try:
+            result_df = spark.sql("""
+                SELECT ai_query(
+                    'databricks-meta-llama-3-1-70b-instruct',
+                    :prompt
+                ) AS response
+            """, args={"prompt": prompt})
+
+            response_text = result_df.collect()[0]["response"].strip()
+            # Parse JSON array from response
+            if response_text.startswith("```"):
+                response_text = response_text.split("\n", 1)[1]
+                response_text = response_text.rsplit("```", 1)[0]
+            
+            suggested_repos = json.loads(response_text)
+            
+            if isinstance(suggested_repos, list):
+                for suggested in suggested_repos:
+                    if (isinstance(suggested, str) 
+                        and "/" in suggested 
+                        and suggested not in already_seen):
+                        ai_suggestions.append((source_repo, suggested))
+                        # Record the dependency edge regardless of validation
+                        record_edge(source_repo, suggested, "dependency",
+                                   {"discovered_by": "ai_query"})
+
+        except Exception as e:
+            print(f"    ⚠ AI analysis failed for {source_repo}: {e}")
+
+    if not ai_suggestions:
+        print("    No new repos suggested by AI")
+        return []
+
+    # Validate suggestions exist on GitHub (rate-limit aware)
+    # Limit validations to conserve API budget
+    max_validations = min(50, MAX_GITHUB_REQUESTS_PER_RUN - _github_request_count)
+    validated = []
+    
+    # Deduplicate suggestions
+    seen_suggestions = set()
+    unique_suggestions = []
+    for source, target in ai_suggestions:
+        if target not in seen_suggestions and target not in already_seen:
+            seen_suggestions.add(target)
+            unique_suggestions.append((source, target))
+
+    print(f"    AI suggested {len(unique_suggestions)} unique new repos, validating up to {max_validations}...")
+
+    for source, suggested_repo in unique_suggestions[:max_validations]:
+        if len(already_seen) >= TARGET_REPOS:
+            break
+        try:
+            # One API call to verify the repo exists
+            client.get_repo(suggested_repo)
+            _github_request_count += 1
+            time.sleep(API_DELAY_SECONDS)
+            validated.append(suggested_repo)
+            already_seen.add(suggested_repo)
+            # Update the edge to mark it as validated
+            record_edge(source, suggested_repo, "ai_suggested",
+                       {"validated": True, "source_type": "dependency_analysis"})
+        except Exception:
+            _github_request_count += 1
+            # Repo doesn't exist or is private - skip silently
+            pass
+
+    print(f"    ✓ Validated {len(validated)} repos from AI suggestions")
+    return validated
+
+
 print(f"Fetch mode: {FETCH_MODE.upper()}")
 print(f"  graphql = 1 GraphQL query (commits+deps) + 1 REST (tree) per repo")
 print(f"  rest    = ~5-7 REST calls per repo")
@@ -615,36 +802,93 @@ driver_client = GitHubClient(token=_github_token)
 for hop in range(1, MAX_HOPS + 1):
     if len(all_fetched) >= TARGET_REPOS:
         break
+    if _github_request_count >= MAX_GITHUB_REQUESTS_PER_RUN:
+        print(f"  ⚠ Approaching API rate limit ({_github_request_count} requests used), stopping early")
+        break
 
+    print(f"\n--- Hop {hop}/{MAX_HOPS} (fetched so far: {len(all_fetched)}) ---")
     staging_df = spark.table(github_staging_table)
-    committer_rows = staging_df.filter("category = 'commit'").select("author_name", "author_email").distinct().collect()
+
+    # =========================================================================
+    # Discovery method 1: Committer-based (committer -> repo edges)
+    # =========================================================================
+    committer_rows = staging_df.filter("category = 'commit'").select("author_name", "author_email", "repo_full_name").distinct().collect()
     committer_usernames = set()
+    committer_to_source_repo = {}  # Track which repo each committer came from
     for row in committer_rows:
         login = (row["author_name"] or "").strip()
         email = (row["author_email"] or "").strip()
+        source_repo = row["repo_full_name"]
+        username = None
         if login and all(ch not in login for ch in (" ", "<", ">")):
-            committer_usernames.add(login)
-        if "+" in email and "@users.noreply.github.com" in email:
-            committer_usernames.add(email.split("+")[1].split("@")[0])
+            username = login
+        elif "+" in email and "@users.noreply.github.com" in email:
+            username = email.split("+")[1].split("@")[0]
         elif "@users.noreply.github.com" in email:
-            committer_usernames.add(email.split("@")[0])
+            username = email.split("@")[0]
+        if username and len(username) > 1 and username not in ("noreply", "actions", "dependabot"):
+            committer_usernames.add(username)
+            if username not in committer_to_source_repo:
+                committer_to_source_repo[username] = source_repo
 
-    committer_usernames = [u for u in committer_usernames if u and len(u) > 1 and u not in ("noreply", "actions", "dependabot")]
+    committer_usernames = list(committer_usernames)
+    print(f"  Committer discovery: {len(committer_usernames)} unique usernames to explore")
+
     if FETCH_MODE == "graphql":
-        new_repos = discover_committer_repos_graphql(committer_usernames, all_fetched, _github_token)
+        committer_repos = discover_committer_repos_graphql(committer_usernames, all_fetched, _github_token)
     else:
-        new_repos = discover_committer_repos(committer_usernames, all_fetched, driver_client)
+        committer_repos = discover_committer_repos(committer_usernames, all_fetched, driver_client)
+
+    # Record committer->repo edges
+    for repo in committer_repos:
+        # Find which committer led to this repo (best effort)
+        for username, source_repo in committer_to_source_repo.items():
+            record_edge(username, repo, "committer",
+                       {"source_repo": source_repo})
+            # Also record repo->repo via shared committer
+            record_edge(source_repo, repo, "shared_committer",
+                       {"via_committer": username})
+            break  # One edge per discovered repo is enough
+
+    print(f"  ✓ Committer discovery found {len(committer_repos)} new repos")
+
+    # =========================================================================
+    # Discovery method 2: AI-powered dependency analysis (repo -> repo edges)
+    # =========================================================================
+    print(f"  AI dependency discovery:")
+    dep_repos = discover_repos_from_dependencies_ai(staging_df, all_fetched, driver_client)
+    print(f"  ✓ Dependency discovery found {len(dep_repos)} new repos")
+
+    # =========================================================================
+    # Combine and fetch all newly discovered repos
+    # =========================================================================
+    new_repos = committer_repos + dep_repos
     if not new_repos:
+        print(f"  No new repos discovered in hop {hop}, stopping")
         break
+
+    print(f"  Fetching {len(new_repos)} new repos (committer: {len(committer_repos)}, deps: {len(dep_repos)})")
     fetch_and_stage(new_repos, mode="append")
+
+    # Estimate API calls used this hop
+    calls_per_repo = 2 if FETCH_MODE == "graphql" else 6
+    _github_request_count += len(new_repos) * calls_per_repo
+    print(f"  Estimated API calls used so far: ~{_github_request_count}")
+
+# Write all graph edges at the end
+print(f"\nWriting {len(_graph_edges)} graph edges...")
+write_graph_edges()
 
 staging_df = spark.table(github_staging_table)
 result = {
     "staging_table": github_staging_table,
+    "graph_edges_table": graph_edges_table,
     "total_repos_staged": staging_df.filter("category = 'file'").select("repo_full_name").distinct().count(),
     "file_count": staging_df.filter("category = 'file'").count(),
     "content_count": staging_df.filter("category = 'content'").count(),
     "commit_count": staging_df.filter("category = 'commit'").count(),
+    "graph_edges_count": len(_graph_edges),
+    "github_api_calls_estimated": _github_request_count,
 }
 print(result)
 dbutils.notebook.exit(json.dumps(result))
