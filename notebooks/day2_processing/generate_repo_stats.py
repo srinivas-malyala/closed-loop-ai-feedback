@@ -13,13 +13,14 @@
 # COMMAND ----------
 
 # DBTITLE 1,Configuration
-dbutils.widgets.text("catalog", "main", "Unity Catalog name")
-dbutils.widgets.text("schema", "ltap_lab_day1", "Schema name")
-dbutils.widgets.text("student_username", "", "Student username (Lakebase schema)")
+dbutils.widgets.text("catalog", "bootcamp_students", "Unity Catalog name")
+dbutils.widgets.text("schema", "username", "Schema name")
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
-student_username = dbutils.widgets.get("student_username")
+
+# Source: CDC history table (mirrored from Lakebase via Change Data Feed)
+repos_history_table = f"{catalog}.{schema}.lb_github_repos_history"
 
 # Delta table targets
 files_bronze_table = f"{catalog}.{schema}.github_repo_files_bronze"
@@ -27,12 +28,9 @@ commits_bronze_table = f"{catalog}.{schema}.github_repo_commits_bronze"
 ai_insights_gold_table = f"{catalog}.{schema}.github_repo_ai_insights_gold"
 file_contents_bronze_table = f"{catalog}.{schema}.github_file_contents_bronze"
 
-# Lakebase source
-lakebase_schema = f"student_{student_username}"
-
 print(f"Catalog: {catalog}")
 print(f"Schema: {schema}")
-print(f"Lakebase schema: {lakebase_schema}")
+print(f"Source (CDC): {repos_history_table}")
 print(f"Files bronze: {files_bronze_table}")
 print(f"File contents bronze: {file_contents_bronze_table}")
 print(f"Commits bronze: {commits_bronze_table}")
@@ -40,21 +38,33 @@ print(f"AI insights gold: {ai_insights_gold_table}")
 
 # COMMAND ----------
 
-# DBTITLE 1,Read repos from Lakebase
+# DBTITLE 1,Read current repos from CDC history table
 import sys
 sys.path.insert(0, "/Workspace/Users/{}/ltap-lab-day-1".format(
     dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
 ))
 
 from github_client import GitHubClient
-import lakebase
 
-# Fetch all repos from the student's Lakebase table
-repos = lakebase.run_query(
-    f"SELECT full_name, is_favorite, language, stargazers_count FROM {lakebase_schema}.github_repos"
-)
+# Read the latest state of each repo from the CDC history table.
+# The history table contains all change events; we want the most recent
+# non-deleted state per repo (latest _sort_by, excluding deletes).
+repos_df = spark.sql(f"""
+    WITH latest AS (
+        SELECT *,
+            ROW_NUMBER() OVER (PARTITION BY full_name ORDER BY _sort_by DESC) AS rn
+        FROM {repos_history_table}
+        WHERE _pg_change_type != 'delete'
+          AND _pg_change_type != 'update_preimage'
+    )
+    SELECT full_name, is_favorite, language, stargazers_count
+    FROM latest
+    WHERE rn = 1
+""")
 
-print(f"Found {len(repos)} repos in {lakebase_schema}.github_repos")
+repos = [row.asDict() for row in repos_df.collect()]
+
+print(f"Found {len(repos)} current repos from {repos_history_table}")
 for r in repos:
     fav = "⭐" if r["is_favorite"] else "  "
     print(f"  {fav} {r['full_name']} ({r['language']}, {r['stargazers_count']}★)")
