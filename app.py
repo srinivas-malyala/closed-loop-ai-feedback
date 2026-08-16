@@ -308,8 +308,8 @@ def get_graph_edges():
     """Return graph edges from the synced Unity Catalog table (uc_github_graph_edges).
     
     Optional query params:
-      - edge_type: filter by type (committer, shared_committer, dependency, ai_suggested)
-      - source: filter by source repo or committer
+      - edge_type: filter by type (dependency, ai_suggested)
+      - source: filter by source repo
       - target: filter by target repo
       - limit: max results (default 200)
     """

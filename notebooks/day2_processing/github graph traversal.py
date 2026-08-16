@@ -6,9 +6,7 @@
 # MAGIC # GitHub Graph Traversal
 # MAGIC
 # MAGIC BFS-style traversal of the GitHub social graph. Starting from seed repos, discovers new
-# MAGIC repositories via two methods:
-# MAGIC 1. **Committer-based**: Find users who committed to known repos → discover their other repos
-# MAGIC 2. **AI dependency analysis**: Parse dependency files → AI suggests upstream repos
+# MAGIC repositories via AI dependency analysis: Parse dependency files → AI suggests upstream repos
 # MAGIC
 # MAGIC Supports two fetch modes:
 # MAGIC - `graphql`: ~2 API calls/repo (1 GraphQL + 1 REST tree). Uses separate rate limit.
@@ -462,82 +460,6 @@ def fetch_all_for_repos_graphql(iterator):
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Discovery: Committer Repos
-
-# COMMAND ----------
-
-_GRAPHQL_USER_REPOS_QUERY = """
-query UserRepos($login: String!) {
-  user(login: $login) {
-    repositories(first: 100, orderBy: {field: PUSHED_AT, direction: DESC}) {
-      nodes { nameWithOwner }
-    }
-  }
-}
-"""
-
-
-def discover_committer_repos_graphql(committer_usernames, already_seen, token):
-    """Discover repos via GraphQL user queries. Returns (username, repo) tuples."""
-    import requests
-
-    graphql_url = "https://api.github.com/graphql"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    discovered = []
-
-    for username in committer_usernames:
-        if len(already_seen) >= TARGET_REPOS:
-            break
-        try:
-            resp = requests.post(
-                graphql_url, headers=headers,
-                json={"query": _GRAPHQL_USER_REPOS_QUERY, "variables": {"login": username}},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            user_data = resp.json().get("data", {}).get("user")
-            if not user_data:
-                continue
-            time.sleep(API_DELAY_SECONDS)
-
-            for repo in user_data.get("repositories", {}).get("nodes", []):
-                full_name = repo.get("nameWithOwner", "")
-                if full_name and full_name not in already_seen:
-                    discovered.append((username, full_name))
-                    already_seen.add(full_name)
-                    if len(already_seen) >= TARGET_REPOS:
-                        break
-        except Exception:
-            pass
-
-    return discovered
-
-
-def discover_committer_repos_rest(committer_usernames, already_seen, client):
-    """Discover repos via REST user endpoint. Returns (username, repo) tuples."""
-    discovered = []
-
-    for username in committer_usernames:
-        if len(already_seen) >= TARGET_REPOS:
-            break
-        try:
-            user_repos = client.get(f"/users/{username}/repos", params={"per_page": 100, "sort": "pushed"})
-            time.sleep(API_DELAY_SECONDS)
-            for repo in user_repos:
-                full_name = repo.get("full_name", "")
-                if full_name and full_name not in already_seen:
-                    discovered.append((username, full_name))
-                    already_seen.add(full_name)
-                    if len(already_seen) >= TARGET_REPOS:
-                        break
-        except Exception:
-            pass
-
-    return discovered
-
-# COMMAND ----------
-
-# MAGIC %md
 # MAGIC ## Discovery: AI Dependency Analysis
 
 # COMMAND ----------
@@ -734,36 +656,6 @@ def fetch_and_stage(repo_names, mode="overwrite"):
     results_df.write.format("delta").mode(mode).option("overwriteSchema", "true").saveAsTable(github_staging_table)
 
 
-def _parse_committer_usernames(committer_rows):
-    """Extract GitHub usernames from commit author metadata.
-
-    Returns:
-        tuple: (list of usernames, dict mapping username → source repo)
-    """
-    usernames = set()
-    username_to_source = {}
-    skip_names = {"noreply", "actions", "dependabot"}
-
-    for row in committer_rows:
-        login = (row["author_name"] or "").strip()
-        email = (row["author_email"] or "").strip()
-        source_repo = row["repo_full_name"]
-
-        username = None
-        if login and all(ch not in login for ch in (" ", "<", ">")):
-            username = login
-        elif "+" in email and "@users.noreply.github.com" in email:
-            username = email.split("+")[1].split("@")[0]
-        elif "@users.noreply.github.com" in email:
-            username = email.split("@")[0]
-
-        if username and len(username) > 1 and username not in skip_names:
-            usernames.add(username)
-            if username not in username_to_source:
-                username_to_source[username] = source_repo
-
-    return list(usernames), username_to_source
-
 # COMMAND ----------
 
 # MAGIC %md
@@ -797,41 +689,18 @@ for hop in range(1, MAX_HOPS + 1):
     print(f"\n--- Hop {hop}/{MAX_HOPS} (fetched so far: {len(all_fetched)}) ---")
     staging_df = spark.table(github_staging_table)
 
-    # --- Discovery 1: Committer-based ---
-    committer_rows = (
-        staging_df.filter("category = 'commit'")
-        .select("author_name", "author_email", "repo_full_name")
-        .distinct().collect()
-    )
-    committer_usernames, committer_to_source = _parse_committer_usernames(committer_rows)
-    print(f"  Committer discovery: {len(committer_usernames)} unique usernames to explore")
-
-    if FETCH_MODE == "graphql":
-        committer_repos_pairs = discover_committer_repos_graphql(committer_usernames, all_fetched, _github_token)
-    else:
-        committer_repos_pairs = discover_committer_repos_rest(committer_usernames, all_fetched, driver_client)
-
-    committer_repos = []
-    for username, repo in committer_repos_pairs:
-        committer_repos.append(repo)
-        source_repo = committer_to_source.get(username, "unknown")
-        record_edge(username, repo, "committer", {"source_repo": source_repo})
-        record_edge(source_repo, repo, "shared_committer", {"via_committer": username})
-
-    print(f"  ✓ Committer discovery found {len(committer_repos)} new repos")
-
-    # --- Discovery 2: AI dependency analysis ---
+    # --- Discovery: AI dependency analysis ---
     print(f"  AI dependency discovery:")
     dep_repos = discover_repos_from_dependencies_ai(staging_df, all_fetched, driver_client)
     print(f"  ✓ Dependency discovery found {len(dep_repos)} new repos")
 
     # --- Fetch newly discovered repos ---
-    new_repos = committer_repos + dep_repos
+    new_repos = dep_repos
     if not new_repos:
         print(f"  No new repos discovered in hop {hop}, stopping")
         break
 
-    print(f"  Fetching {len(new_repos)} new repos (committer: {len(committer_repos)}, deps: {len(dep_repos)})")
+    print(f"  Fetching {len(new_repos)} new repos")
     fetch_and_stage(new_repos, mode="append")
 
     calls_per_repo = 2 if FETCH_MODE == "graphql" else 6

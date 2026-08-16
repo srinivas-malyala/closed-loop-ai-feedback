@@ -28,8 +28,8 @@ snapshot each run, rather than row-level change capture.
 
 **Day 2** is where the heavy lifting happens: multi-hop graph traversal
 starting from your watchlist repos (`notebooks/day2_processing/`). The graph
-crawler discovers related repositories via shared committers and AI-powered
-dependency analysis, landing staging and edge tables that get synced back to
+crawler discovers related repositories via AI-powered dependency analysis,
+landing staging and edge tables that get synced back to
 Lakebase.
 
 The point of the demo: **you should never run heavy graph traversal or
@@ -120,7 +120,7 @@ the widgets:
 - `fetch_mode` — `graphql` (recommended, ~2 API calls/repo) or `rest` (~6 calls/repo)
 
 This starts from your watchlist repos (seed repos) and discovers related
-repositories via shared committers and AI-powered dependency analysis.
+repositories via AI-powered dependency analysis.
 Output lands in `github_api_staging` and `github_graph_edges`.
 
 ### 7. Sync graph data back to Lakebase (Synced Tables)
@@ -212,7 +212,6 @@ watchlist (seed repos). It builds a relationship graph using two discovery metho
 
 | Method | Edge Type | How it works |
 |--------|-----------|--------------|
-| **Committer-based** | `committer`, `shared_committer` | Finds GitHub usernames from commit history, then fetches their other public repos. Connects repos that share contributors. |
 | **AI dependency analysis** | `dependency`, `ai_suggested` | Reads dependency files (package.json, requirements.txt, etc.), sends them to `ai_query` (Llama 3.1 70B) which suggests specific `owner/repo` names, then validates they exist on GitHub. |
 
 ### Output Tables
@@ -225,10 +224,10 @@ watchlist (seed repos). It builds a relationship graph using two discovery metho
 ### Graph Edges Schema
 
 ```
-source          STRING    -- committer username or source repo (owner/repo)
+source          STRING    -- source repo (owner/repo)
 target          STRING    -- discovered repo (owner/repo)
-edge_type       STRING    -- "committer", "shared_committer", "dependency", "ai_suggested"
-metadata        STRING    -- JSON with context (e.g. {"via_committer": "username", "source_repo": "org/repo"})
+edge_type       STRING    -- "dependency", "ai_suggested"
+metadata        STRING    -- JSON with context (e.g. {"source_repo": "org/repo"})
 discovered_at   STRING    -- ISO timestamp of when the edge was recorded
 ```
 
@@ -253,11 +252,6 @@ To make the graph traversal results queryable from the Flask app (or any Postgre
    FROM github_graph_edges
    WHERE source = 'facebook/react';
 
-   -- Find repos discovered via shared committers
-   SELECT source, target, metadata->>'via_committer' AS committer
-   FROM github_graph_edges
-   WHERE edge_type = 'shared_committer';
-
    -- Find AI-suggested repos from dependency analysis
    SELECT source, target
    FROM github_graph_edges
@@ -269,7 +263,6 @@ To make the graph traversal results queryable from the Flask app (or any Postgre
 The traversal tracks GitHub API usage and stops early if approaching the
 5,000 requests/hour limit. Budget allocation:
 - **Per-repo fetch**: ~2 calls (GraphQL mode) or ~6 calls (REST mode)
-- **Committer discovery**: 1 call per username (GraphQL, separate rate limit)
 - **AI validation**: 1 call per suggested repo (capped at 50/hop)
 - **Hard cap**: 4,000 requests per run (leaves headroom)
 

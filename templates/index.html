@@ -58,7 +58,7 @@
 
   <hr style="margin-top:40px;">
   <h2 style="font-size:18px;">Repo Graph</h2>
-  <p class="hint">Relationships discovered via graph traversal (committers + AI dependency analysis). Synced from Unity Catalog.</p>
+  <p class="hint">Relationships discovered via graph traversal (AI dependency analysis). Synced from Unity Catalog.</p>
   <div id="repo-filter-indicator" style="display:none; margin-bottom:8px; font-size:13px; background:#e3f2fd; border-radius:4px; padding:6px 10px;">
     Filtering graph by: <strong id="repo-filter-name"></strong>
     <button onclick="clearRepoFilter()" style="margin-left:8px; cursor:pointer; background:none; border:none; color:#1565c0; font-size:13px;">✕ Clear</button>
@@ -68,8 +68,6 @@
     <label for="edge-filter" style="display:inline; font-size:13px;">Filter by type:</label>
     <select id="edge-filter" onchange="loadEdges()" style="padding:4px 8px;">
       <option value="">All</option>
-      <option value="shared_committer">Shared Committer</option>
-      <option value="committer">Committer → Repo</option>
       <option value="dependency">Dependency</option>
       <option value="ai_suggested">AI Suggested</option>
     </select>
@@ -247,8 +245,7 @@
           if (edge.metadata) {
             try {
               const meta = JSON.parse(edge.metadata);
-              if (meta.via_committer) details = `via ${meta.via_committer}`;
-              else if (meta.source_repo) details = `from ${meta.source_repo}`;
+              if (meta.source_repo) details = `from ${meta.source_repo}`;
               else if (meta.validated) details = "✓ validated";
               else details = Object.entries(meta).map(([k,v]) => `${k}: ${v}`).join(", ");
             } catch(e) { details = edge.metadata; }
