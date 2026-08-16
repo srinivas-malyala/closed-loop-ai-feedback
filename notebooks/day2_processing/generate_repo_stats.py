@@ -14,7 +14,7 @@
 
 # DBTITLE 1,Configuration
 dbutils.widgets.text("catalog", "bootcamp_students", "Unity Catalog name")
-dbutils.widgets.text("schema", "username", "Schema name")
+dbutils.widgets.text("schema", "<your username>", "Schema name")
 
 catalog = dbutils.widgets.get("catalog")
 schema = dbutils.widgets.get("schema")
@@ -71,46 +71,14 @@ for r in repos:
 
 # COMMAND ----------
 
-# DBTITLE 1,Fetch file trees for all repos
-from datetime import datetime
-
-client = GitHubClient()
-all_files = []
-
-for repo in repos:
-    full_name = repo["full_name"]
-    print(f"Fetching file tree for {full_name}...")
-    try:
-        # Use default branch - get repo metadata first for the default branch
-        repo_meta = client.get_repo(full_name)
-        default_branch = repo_meta.get("default_branch", "main")
-        tree_data = client.get_repo_tree(full_name, ref=default_branch)
-
-        tree_entries = tree_data.get("tree", [])
-        truncated = tree_data.get("truncated", False)
-
-        for entry in tree_entries:
-            all_files.append({
-                "repo_full_name": full_name,
-                "path": entry.get("path"),
-                "type": entry.get("type"),  # "blob" or "tree"
-                "sha": entry.get("sha"),
-                "size": entry.get("size"),
-                "mode": entry.get("mode"),
-                "tree_truncated": truncated,
-                "ingested_at": datetime.utcnow().isoformat(),
-            })
-
-        print(f"  → {len(tree_entries)} entries (truncated={truncated})")
-    except Exception as e:
-        print(f"  ✗ Error fetching tree for {full_name}: {e}")
-
-print(f"\nTotal file entries collected: {len(all_files)}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Fetch file contents for all repos
+# DBTITLE 1,Executor-side GitHub fetching setup
 import base64
+import time
+from datetime import datetime
+from pyspark.sql import Row
+from pyspark.sql.types import (
+    StructType, StructField, StringType, LongType, BooleanType, TimestampType
+)
 
 # File extensions we consider "text" and worth fetching content for
 TEXT_EXTENSIONS = {
@@ -125,112 +93,171 @@ TEXT_EXTENSIONS = {
     "gitignore", "env", "editorconfig",
 }
 
-# Max file size to fetch (100KB) - skip large generated/vendored files
+# Max file size to fetch content for (100KB)
 MAX_CONTENT_SIZE = 100_000
 
-all_file_contents = []
-
-for repo in repos:
-    full_name = repo["full_name"]
-    repo_meta = client.get_repo(full_name)
-    default_branch = repo_meta.get("default_branch", "main")
-
-    # Filter to text files under size limit
-    repo_files = [
-        f for f in all_files
-        if f["repo_full_name"] == full_name
-        and f["type"] == "blob"
-        and (f.get("size") or 0) <= MAX_CONTENT_SIZE
-        and (f["path"].rsplit(".", 1)[-1].lower() if "." in f["path"]
-             else f["path"].rsplit("/", 1)[-1].lower()) in TEXT_EXTENSIONS
-    ]
-
-    print(f"Fetching contents for {full_name}: {len(repo_files)} text files...")
-    fetched = 0
-    errors = 0
-
-    for file_entry in repo_files:
-        file_path = file_entry["path"]
-        try:
-            content_data = client.get_file_content(full_name, file_path, ref=default_branch)
-
-            # Decode base64 content
-            raw_content = content_data.get("content", "")
-            encoding = content_data.get("encoding", "base64")
-            if encoding == "base64" and raw_content:
-                decoded = base64.b64decode(raw_content).decode("utf-8", errors="replace")
-            else:
-                decoded = raw_content
-
-            # Detect language from extension
-            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
-
-            all_file_contents.append({
-                "repo_full_name": full_name,
-                "path": file_path,
-                "content": decoded[:500_000],  # Safety cap at 500KB decoded
-                "encoding": encoding,
-                "sha": content_data.get("sha"),
-                "size": content_data.get("size"),
-                "language": ext,
-                "ingested_at": datetime.utcnow().isoformat(),
-            })
-            fetched += 1
-
-        except Exception as e:
-            errors += 1
-            if errors <= 3:
-                print(f"    ✗ {file_path}: {e}")
-
-    print(f"  → Fetched {fetched} files ({errors} errors)")
-
-print(f"\nTotal file contents collected: {len(all_file_contents)}")
+# Rate limit: pause between API calls to stay under GitHub's limits
+# With N executors hitting in parallel, keep per-partition delay conservative
+API_DELAY_SECONDS = 0.1
 
 # COMMAND ----------
 
-# DBTITLE 1,Fetch commits for all repos
-all_commits = []
+# DBTITLE 1,Fetch file trees + contents + commits (distributed on executors)
 
-for repo in repos:
-    full_name = repo["full_name"]
-    print(f"Fetching commits for {full_name}...")
-    try:
-        commits = client.get_commits(full_name, max_results=200)
+# Distribute repos across executors - one partition per repo for isolation
+# This ensures each executor handles one repo's full API interaction
+num_repos = len(repos)
+repos_rdd = sc.parallelize(repos, numSlices=min(num_repos, 8))
 
-        for c in commits:
-            commit_data = c.get("commit", {})
-            author = commit_data.get("author", {}) or {}
-            committer = commit_data.get("committer", {}) or {}
-            stats = c.get("stats", {}) or {}
 
-            all_commits.append({
-                "repo_full_name": full_name,
-                "sha": c.get("sha"),
-                "author_name": author.get("name"),
-                "author_email": author.get("email"),
-                "author_date": author.get("date"),
-                "committer_name": committer.get("name"),
-                "committer_email": committer.get("email"),
-                "committer_date": committer.get("date"),
-                "message": commit_data.get("message", "")[:1000],  # Truncate long messages
-                "additions": stats.get("additions"),
-                "deletions": stats.get("deletions"),
-                "ingested_at": datetime.utcnow().isoformat(),
-            })
+def fetch_all_for_repo(repo_iter):
+    """
+    Executor-side function: for each repo in this partition, fetch the
+    file tree, file contents (text files only), and commits.
 
-        print(f"  → {len(commits)} commits")
-    except Exception as e:
-        print(f"  ✗ Error fetching commits for {full_name}: {e}")
+    Yields (category, dict) tuples where category is 'file', 'content', or 'commit'.
+    A fresh GitHubClient is instantiated per partition (Sessions aren't serializable).
+    """
+    # Import inside executor - these modules must be available on workers
+    import base64
+    import time
+    from datetime import datetime
 
-print(f"\nTotal commits collected: {len(all_commits)}")
+    # Add the project path for GitHubClient import on executors
+    import sys
+    sys.path.insert(0, "/Workspace/Users/{}/ltap-lab-day-1".format(
+        # This will be replaced by broadcast variable
+        _workspace_user.value
+    ))
+    from github_client import GitHubClient
+
+    client = GitHubClient()
+
+    for repo in repo_iter:
+        full_name = repo["full_name"]
+
+        # --- 1. Fetch file tree ---
+        try:
+            repo_meta = client.get_repo(full_name)
+            time.sleep(API_DELAY_SECONDS)
+            default_branch = repo_meta.get("default_branch", "main")
+
+            tree_data = client.get_repo_tree(full_name, ref=default_branch)
+            time.sleep(API_DELAY_SECONDS)
+
+            tree_entries = tree_data.get("tree", [])
+            truncated = tree_data.get("truncated", False)
+            ingested_at = datetime.utcnow().isoformat()
+
+            for entry in tree_entries:
+                yield ("file", {
+                    "repo_full_name": full_name,
+                    "path": entry.get("path"),
+                    "type": entry.get("type"),
+                    "sha": entry.get("sha"),
+                    "size": entry.get("size"),
+                    "mode": entry.get("mode"),
+                    "tree_truncated": truncated,
+                    "ingested_at": ingested_at,
+                })
+
+            # --- 2. Fetch file contents for text files under size limit ---
+            text_files = [
+                e for e in tree_entries
+                if e.get("type") == "blob"
+                and (e.get("size") or 0) <= MAX_CONTENT_SIZE
+                and (e["path"].rsplit(".", 1)[-1].lower() if "." in e["path"]
+                     else e["path"].rsplit("/", 1)[-1].lower()) in TEXT_EXTENSIONS
+            ]
+
+            for file_entry in text_files:
+                file_path = file_entry["path"]
+                try:
+                    content_data = client.get_file_content(full_name, file_path, ref=default_branch)
+                    time.sleep(API_DELAY_SECONDS)
+
+                    raw_content = content_data.get("content", "")
+                    encoding = content_data.get("encoding", "base64")
+                    if encoding == "base64" and raw_content:
+                        decoded = base64.b64decode(raw_content).decode("utf-8", errors="replace")
+                    else:
+                        decoded = raw_content
+
+                    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+
+                    yield ("content", {
+                        "repo_full_name": full_name,
+                        "path": file_path,
+                        "content": decoded[:500_000],
+                        "encoding": encoding,
+                        "sha": content_data.get("sha"),
+                        "size": content_data.get("size"),
+                        "language": ext,
+                        "ingested_at": datetime.utcnow().isoformat(),
+                    })
+                except Exception:
+                    pass  # Skip files that fail (permissions, too large, etc.)
+
+        except Exception:
+            pass  # Skip repos where tree fetch fails entirely
+
+        # --- 3. Fetch commits ---
+        try:
+            commits = client.get_commits(full_name, max_results=200)
+            time.sleep(API_DELAY_SECONDS)
+
+            for c in commits:
+                commit_data = c.get("commit", {})
+                author = commit_data.get("author", {}) or {}
+                committer = commit_data.get("committer", {}) or {}
+                stats = c.get("stats", {}) or {}
+
+                yield ("commit", {
+                    "repo_full_name": full_name,
+                    "sha": c.get("sha"),
+                    "author_name": author.get("name"),
+                    "author_email": author.get("email"),
+                    "author_date": author.get("date"),
+                    "committer_name": committer.get("name"),
+                    "committer_email": committer.get("email"),
+                    "committer_date": committer.get("date"),
+                    "message": commit_data.get("message", "")[:1000],
+                    "additions": stats.get("additions"),
+                    "deletions": stats.get("deletions"),
+                    "ingested_at": datetime.utcnow().isoformat(),
+                })
+        except Exception:
+            pass  # Skip repos where commit fetch fails
+
+
+# Broadcast the workspace username so executors can find the project path
+_workspace_user = sc.broadcast(
+    dbutils.notebook.entry_point.getDbutils().notebook().getContext().userName().get()
+)
+
+# Execute on the cluster - this runs fetch_all_for_repo across executors
+print(f"Distributing GitHub API fetching across executors for {num_repos} repos...")
+results_rdd = repos_rdd.flatMap(lambda repo: fetch_all_for_repo(iter([repo])))
+
+# Cache to avoid re-fetching when we separate by category
+results_rdd.cache()
+
+# Separate results by category
+all_files = [r[1] for r in results_rdd.filter(lambda x: x[0] == "file").collect()]
+all_file_contents = [r[1] for r in results_rdd.filter(lambda x: x[0] == "content").collect()]
+all_commits = [r[1] for r in results_rdd.filter(lambda x: x[0] == "commit").collect()]
+
+# Unpersist after collection
+results_rdd.unpersist()
+
+print(f"✓ File tree entries: {len(all_files)}")
+print(f"✓ File contents fetched: {len(all_file_contents)}")
+print(f"✓ Commits fetched: {len(all_commits)}")
 
 # COMMAND ----------
 
 # DBTITLE 1,Write files to bronze Delta table
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField, StringType, LongType, BooleanType, TimestampType
-)
 
 files_schema = StructType([
     StructField("repo_full_name", StringType(), False),
