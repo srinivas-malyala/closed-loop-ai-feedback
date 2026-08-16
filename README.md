@@ -196,6 +196,77 @@ warning banner if the schema/tables haven't been created yet.
 4. **Surface**: Load the app, show `/insights` serving that data instantly, and add a repo to the personal watchlist live.
 5. **Payoff**: "Heavy Spark processing happened entirely in the lake - the app never touched Spark, it just reads a synced Postgres table."
 
+## Graph Traversal & Repo Discovery
+
+The notebook `notebooks/day2_processing/github graph traversal.py` implements a
+multi-hop graph crawl that discovers related repositories starting from your
+watchlist (seed repos). It builds a relationship graph using two discovery methods:
+
+### Discovery Methods
+
+| Method | Edge Type | How it works |
+|--------|-----------|--------------|
+| **Committer-based** | `committer`, `shared_committer` | Finds GitHub usernames from commit history, then fetches their other public repos. Connects repos that share contributors. |
+| **AI dependency analysis** | `dependency`, `ai_suggested` | Reads dependency files (package.json, requirements.txt, etc.), sends them to `ai_query` (Llama 3.1 70B) which suggests specific `owner/repo` names, then validates they exist on GitHub. |
+
+### Output Tables
+
+| Table | Description |
+|-------|-------------|
+| `github_api_staging` | Raw data (files, dependency contents, commits) for all discovered repos |
+| `github_graph_edges` | Relationship graph: who/what led to each repo's discovery |
+
+### Graph Edges Schema
+
+```
+source          STRING    -- committer username or source repo (owner/repo)
+target          STRING    -- discovered repo (owner/repo)
+edge_type       STRING    -- "committer", "shared_committer", "dependency", "ai_suggested"
+metadata        STRING    -- JSON with context (e.g. {"via_committer": "username", "source_repo": "org/repo"})
+discovered_at   STRING    -- ISO timestamp of when the edge was recorded
+```
+
+### Syncing Graph Data to Lakebase
+
+To make the graph traversal results queryable from the Flask app (or any Postgres client):
+
+1. **Run the graph traversal notebook** — configure widgets:
+   - `catalog` / `schema` — your Unity Catalog location
+   - `target_repos` — how many repos to discover (default: 500)
+   - `max_hops` — depth of traversal (default: 3)
+   - `fetch_mode` — `graphql` (recommended, ~2 API calls/repo) or `rest` (~6 calls/repo)
+
+2. **Create Synced Tables** in the Lakebase UI for:
+   - `github_api_staging` — all raw repo data (files, contents, commits)
+   - `github_graph_edges` — the relationship graph
+
+3. **Query the graph** in Postgres:
+   ```sql
+   -- Find all repos connected to a specific repo
+   SELECT target, edge_type, metadata
+   FROM github_graph_edges
+   WHERE source = 'facebook/react';
+
+   -- Find repos discovered via shared committers
+   SELECT source, target, metadata->>'via_committer' AS committer
+   FROM github_graph_edges
+   WHERE edge_type = 'shared_committer';
+
+   -- Find AI-suggested repos from dependency analysis
+   SELECT source, target
+   FROM github_graph_edges
+   WHERE edge_type = 'ai_suggested';
+   ```
+
+### Rate Limit Awareness
+
+The traversal tracks GitHub API usage and stops early if approaching the
+5,000 requests/hour limit. Budget allocation:
+- **Per-repo fetch**: ~2 calls (GraphQL mode) or ~6 calls (REST mode)
+- **Committer discovery**: 1 call per username (GraphQL, separate rate limit)
+- **AI validation**: 1 call per suggested repo (capped at 50/hop)
+- **Hard cap**: 4,000 requests per run (leaves headroom)
+
 ## Notes
 
 - Lakebase auth uses a single `LAKEBASE_URL` secret pointing at a native Postgres role with a
