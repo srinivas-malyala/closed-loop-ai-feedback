@@ -537,7 +537,8 @@ query UserRepos($login: String!) {
 
 
 def discover_committer_repos_graphql(committer_usernames, already_seen, token):
-    """Discover repos via GraphQL user queries. Uses GraphQL rate limit (separate from REST)."""
+    """Discover repos via GraphQL user queries. Uses GraphQL rate limit (separate from REST).
+    Returns list of (username, repo_full_name) tuples for edge tracking."""
     import requests
     graphql_url = "https://api.github.com/graphql"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -562,7 +563,7 @@ def discover_committer_repos_graphql(committer_usernames, already_seen, token):
             for repo in repos_nodes:
                 full_name = repo.get("nameWithOwner", "")
                 if full_name and full_name not in already_seen:
-                    discovered.append(full_name)
+                    discovered.append((username, full_name))
                     already_seen.add(full_name)
                     if len(already_seen) >= TARGET_REPOS:
                         break
@@ -586,6 +587,7 @@ def fetch_and_stage(repo_names, mode="overwrite"):
 
 
 def discover_committer_repos(committer_usernames, already_seen, client):
+    """Returns list of (username, repo_full_name) tuples for edge tracking."""
     discovered = []
     for username in committer_usernames:
         if len(already_seen) >= TARGET_REPOS:
@@ -596,7 +598,7 @@ def discover_committer_repos(committer_usernames, already_seen, client):
             for repo in user_repos:
                 full_name = repo.get("full_name", "")
                 if full_name and full_name not in already_seen:
-                    discovered.append(full_name)
+                    discovered.append((username, full_name))
                     already_seen.add(full_name)
                     if len(already_seen) >= TARGET_REPOS:
                         break
@@ -835,20 +837,20 @@ for hop in range(1, MAX_HOPS + 1):
     print(f"  Committer discovery: {len(committer_usernames)} unique usernames to explore")
 
     if FETCH_MODE == "graphql":
-        committer_repos = discover_committer_repos_graphql(committer_usernames, all_fetched, _github_token)
+        committer_repos_pairs = discover_committer_repos_graphql(committer_usernames, all_fetched, _github_token)
     else:
-        committer_repos = discover_committer_repos(committer_usernames, all_fetched, driver_client)
+        committer_repos_pairs = discover_committer_repos(committer_usernames, all_fetched, driver_client)
 
-    # Record committer->repo edges
-    for repo in committer_repos:
-        # Find which committer led to this repo (best effort)
-        for username, source_repo in committer_to_source_repo.items():
-            record_edge(username, repo, "committer",
-                       {"source_repo": source_repo})
-            # Also record repo->repo via shared committer
-            record_edge(source_repo, repo, "shared_committer",
-                       {"via_committer": username})
-            break  # One edge per discovered repo is enough
+    # Record committer->repo edges with accurate attribution
+    committer_repos = []
+    for username, repo in committer_repos_pairs:
+        committer_repos.append(repo)
+        source_repo = committer_to_source_repo.get(username, "unknown")
+        record_edge(username, repo, "committer",
+                   {"source_repo": source_repo})
+        # Also record repo->repo via shared committer
+        record_edge(source_repo, repo, "shared_committer",
+                   {"via_committer": username})
 
     print(f"  ✓ Committer discovery found {len(committer_repos)} new repos")
 
