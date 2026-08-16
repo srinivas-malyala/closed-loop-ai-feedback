@@ -1,7 +1,7 @@
 resources:
   jobs:
-    process_repo_insights_on_change:
-      name: "Process Repo Insights (triggered by lb_github_repos_history)"
+    generate_repo_scd_on_change:
+      name: "Generate Repo SCD (triggered by lb_github_repos_history)"
       description: >
         Triggered automatically when lb_github_repos_history receives changes.
         Waits 60 seconds after the last change before running, to batch

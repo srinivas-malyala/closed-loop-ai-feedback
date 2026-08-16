@@ -4,15 +4,15 @@ A Databricks App that demonstrates the full LTAP round trip, split across two
 lab days:
 
 ```
-Day 1: CDC / replication into Delta       Day 2: heavy Spark processing
+Day 1: CDC / replication into Delta       Day 2: Graph traversal & discovery
 ------------------------------------      ------------------------------------
-GitHub API --(ingest notebooks)-->        Bronze Delta --(Spark aggregation/
-  Bronze Delta (raw repos + files)          ranking)--> Gold Delta (per-repo/
-                                             per-language insights)
+GitHub API --(ingest notebooks)-->        Watchlist (seed repos) --(multi-hop
+  Bronze Delta (raw repos + files)          graph crawl)--> github_api_staging
+                                             + github_graph_edges (Delta)
                                                         |
                                              (Databricks Synced Table, reverse ETL)
                                                         v
-                                             Lakebase Postgres (read-only insights table)
+                                             Lakebase Postgres (read-only graph tables)
                                                         |
                                              Flask app  <-- also writes a personal
                                                             watchlist table, and
@@ -26,14 +26,17 @@ GitHub's REST API has no native CDC/webhook change stream for this lab's
 scope, so "replication" here means: re-fetch and overwrite/append the full
 snapshot each run, rather than row-level change capture.
 
-**Day 2** is where the heavy lifting happens: real Spark aggregation/ranking
-work on top of the Bronze tables (`notebooks/day2_processing/`), landing a
-Gold Delta table that gets synced back to Lakebase.
+**Day 2** is where the heavy lifting happens: multi-hop graph traversal
+starting from your watchlist repos (`notebooks/day2_processing/`). The graph
+crawler discovers related repositories via shared committers and AI-powered
+dependency analysis, landing staging and edge tables that get synced back to
+Lakebase.
 
-The point of the demo: **you should never run heavy aggregation/ranking
-inside your operational Postgres database.** Do it in Spark on Delta, then
-sync the *result* back into Lakebase as a fast, read-only table your app can
-query with simple SQL - no Spark cluster needed at request time.
+The point of the demo: **you should never run heavy graph traversal or
+discovery logic inside your operational Postgres database.** Do it in Spark
+on Delta, then sync the *result* back into Lakebase as fast, read-only
+tables your app can query with simple SQL - no Spark cluster needed at
+request time.
 
 ## Files
 
@@ -43,7 +46,6 @@ query with simple SQL - no Spark cluster needed at request time.
 - `setup_secrets.py` - One-time script to store the Lakebase URL and an optional GitHub PAT
 - `notebooks/day1_ingest/ingest_github_repos.py` - Day 1. Pulls repos from GitHub's Search API into a Bronze Delta table
 - `notebooks/day1_ingest/ingest_github_files.py` - Day 1. Walks every repo's full file tree (Git Trees API, limited concurrency) into a Bronze Delta table
-- `notebooks/day2_processing/process_repo_insights.py` - Day 2. The "heavy" Spark stage: per-language rollups + per-language ranking, writes a Gold Delta table
 - `app.yaml` - Databricks App deployment config (command + env vars)
 - `.env.example` - Local dev env var template (copy to `.env`, do not commit real values)
 - `templates/index.html` - UI: add repos to your watchlist, browse Spark-processed insights
@@ -108,28 +110,32 @@ to fetch the entire file tree, then flattens every file (`path`, `size`,
 Output lands in `github_repo_files_bronze`, one row per file, keyed by
 `repo_full_name`.
 
-### 6. Day 2 - Run the "heavy" Spark processing stage
+### 6. Day 2 - Run the graph traversal
 
-Open `notebooks/day2_processing/process_repo_insights.py` and run it against the same
-catalog/schema. This reads `github_repos_bronze` and does real Spark work:
-- Groups repos by language and computes rollups (repo count, total/avg stars, total open issues, total forks)
-- Uses a window function to rank repos within each language by star count
-- Computes a normalized `popularity_score` (0-1) relative to the top repo per language
+Open `notebooks/day2_processing/github graph traversal.py` and run it. Configure
+the widgets:
+- `catalog` / `schema` — your Unity Catalog location
+- `target_repos` — how many repos to discover (default: 500)
+- `max_hops` — depth of traversal (default: 3)
+- `fetch_mode` — `graphql` (recommended, ~2 API calls/repo) or `rest` (~6 calls/repo)
 
-Output lands in `github_repo_insights_gold`.
+This starts from your watchlist repos (seed repos) and discovers related
+repositories via shared committers and AI-powered dependency analysis.
+Output lands in `github_api_staging` and `github_graph_edges`.
 
-### 7. Sync processed data back to Lakebase (Synced Table)
+### 7. Sync graph data back to Lakebase (Synced Tables)
 
 1. In your Databricks workspace, open the **Lakebase** tab for your instance.
-2. Go to **Synced Tables** and click **Create synced table** (sometimes under **Lakebase** > **Sync data** > **New synced table**).
-3. Select your Unity Catalog **catalog.schema.github_repo_insights_gold** as the source table.
-4. Choose a sync mode (snapshot or continuous - snapshot is fine for this demo since the Gold table is only refreshed when you re-run the notebook).
-5. Confirm - Databricks creates a **read-only** Postgres table named `github_repo_insights_gold` (matching `INSIGHTS_TABLE_NAME` in `app.yaml`) inside your Lakebase instance, kept in sync from the Delta table.
+2. Go to **Synced Tables** and click **Create synced table**.
+3. Create synced tables for both:
+   - `github_api_staging` — all raw repo data (files, contents, commits)
+   - `github_graph_edges` — the relationship graph
+4. Choose a sync mode (snapshot or continuous - snapshot is fine for this demo).
+5. Confirm - Databricks creates **read-only** Postgres tables inside your Lakebase instance, kept in sync from the Delta tables.
 
-> **Note:** Synced Tables are read-only in Postgres by design - this app
-> never writes to `github_repo_insights_gold`, only reads from it via `/insights`.
-> Re-run the notebooks and the synced table updates automatically (per the
-> sync schedule you chose); no app changes needed.
+> **Note:** Synced Tables are read-only in Postgres by design - the app
+> never writes to these tables, only reads from them. Re-run the notebook
+> and the synced tables update automatically (per the sync schedule you chose).
 
 ### 8. Configure environment variables (local dev)
 
@@ -191,10 +197,10 @@ warning banner if the schema/tables haven't been created yet.
 ## Demo narrative (suggested flow)
 
 1. **Day 1 - Ingest/replicate**: Run `notebooks/day1_ingest/ingest_github_repos.py` (and optionally `ingest_github_files.py`) live, show the raw Bronze table(s).
-2. **Day 2 - Process**: Run `notebooks/day2_processing/process_repo_insights.py`, show the Spark job plan/DAG and the resulting Gold table with rankings.
-3. **Sync back**: Create the Synced Table in the Lakebase UI, show the new read-only table appear in Postgres (`psql` or SQL editor).
-4. **Surface**: Load the app, show `/insights` serving that data instantly, and add a repo to the personal watchlist live.
-5. **Payoff**: "Heavy Spark processing happened entirely in the lake - the app never touched Spark, it just reads a synced Postgres table."
+2. **Day 2 - Graph traversal**: Run `notebooks/day2_processing/github graph traversal.py`, show the multi-hop discovery crawling from seed repos, building the relationship graph.
+3. **Sync back**: Create Synced Tables in the Lakebase UI for `github_api_staging` and `github_graph_edges`, show them appear in Postgres.
+4. **Surface**: Load the app, show graph-discovered repos and relationships, add repos to the personal watchlist live.
+5. **Payoff**: "Heavy graph traversal and AI-powered discovery happened entirely in the lake - the app never touched Spark, it just reads synced Postgres tables."
 
 ## Graph Traversal & Repo Discovery
 
@@ -273,5 +279,5 @@ The traversal tracks GitHub API usage and stops early if approaching the
   static, non-expiring password - no token refresh logic needed in `lakebase.py`.
 - GitHub auth is optional; `github_client.py` and the ingestion notebook both fall back to
   unauthenticated requests if no token secret is configured.
-- The `watchlist` table is the only table this app writes to directly - `github_repo_insights_gold`
-  is owned by the Synced Table pipeline and must not be written to from the app.
+- The `watchlist` table is the only table this app writes to directly - `github_api_staging` and
+  `github_graph_edges` are owned by the Synced Table pipeline and must not be written to from the app.
