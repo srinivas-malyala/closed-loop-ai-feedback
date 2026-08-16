@@ -104,6 +104,41 @@ class GitHubClient:
         """
         return self.get(f"/repos/{full_name}")
 
+    def get_commits(
+        self,
+        full_name: str,
+        per_page: int = 100,
+        max_results: int = 200,
+        sha: str | None = None,
+    ) -> list[dict]:
+        """
+        Fetch commit history for a repository. Returns up to max_results
+        commits, newest first. Uses pagination to gather beyond per_page.
+
+        Args:
+            full_name: "owner/repo" string.
+            per_page: Results per API page (max 100).
+            max_results: Stop after this many commits total.
+            sha: Optional branch/tag/SHA to list commits from.
+        """
+        commits: list[dict] = []
+        page = 1
+        while len(commits) < max_results:
+            params: dict = {"per_page": per_page, "page": page}
+            if sha:
+                params["sha"] = sha
+            data = self.get(f"/repos/{full_name}/commits", params=params)
+            if not data:
+                break
+            for item in data:
+                if len(commits) >= max_results:
+                    break
+                commits.append(item)
+            if len(data) < per_page:
+                break
+            page += 1
+        return commits
+
     def get_repo_tree(self, full_name: str, ref: str, recursive: bool = True) -> dict:
         """
         Fetch the full file tree for a repository in ONE API call via the Git
