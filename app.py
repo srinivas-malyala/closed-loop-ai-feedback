@@ -303,6 +303,81 @@ def toggle_favorite():
     return jsonify({"full_name": full_name, "is_favorite": bool(is_favorite)})
 
 
+@app.route("/graph/edges", methods=["GET"])
+def get_graph_edges():
+    """Return graph edges from the synced Unity Catalog table (uc_github_graph_edges).
+    
+    Optional query params:
+      - edge_type: filter by type (committer, shared_committer, dependency, ai_suggested)
+      - source: filter by source repo or committer
+      - target: filter by target repo
+      - limit: max results (default 200)
+    """
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
+
+    schema = _schema_for(username)
+    edge_type = request.args.get("edge_type")
+    source = request.args.get("source")
+    target = request.args.get("target")
+    limit = min(int(request.args.get("limit", 200)), 1000)
+
+    conditions = []
+    params = []
+
+    if edge_type:
+        conditions.append("edge_type = %s")
+        params.append(edge_type)
+    if source:
+        conditions.append("source = %s")
+        params.append(source)
+    if target:
+        conditions.append("target = %s")
+        params.append(target)
+
+    where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    params.append(limit)
+
+    try:
+        rows = lakebase.run_query(
+            f"SELECT source, target, edge_type, metadata, discovered_at "
+            f"FROM {schema}.uc_github_graph_edges"
+            f"{where_clause} ORDER BY discovered_at DESC LIMIT %s",
+            tuple(params),
+        )
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return jsonify({"error": "Graph edges table not found. Sync the github_graph_edges Delta table to Lakebase first."}), 404
+        raise
+
+    return jsonify(rows)
+
+
+@app.route("/graph/stats", methods=["GET"])
+def get_graph_stats():
+    """Return summary stats about the graph edges."""
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
+
+    schema = _schema_for(username)
+
+    try:
+        rows = lakebase.run_query(
+            f"SELECT edge_type, COUNT(*) as count "
+            f"FROM {schema}.uc_github_graph_edges "
+            f"GROUP BY edge_type ORDER BY count DESC"
+        )
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return jsonify({"error": "Graph edges table not found."}), 404
+        raise
+
+    total = sum(r["count"] for r in rows)
+    return jsonify({"total_edges": total, "by_type": rows})
+
+
 @app.route("/repos", methods=["DELETE"])
 def remove_repo():
     """
