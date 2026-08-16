@@ -288,9 +288,6 @@ display(repo_stats)
 
 # DBTITLE 1,AI Processing - Favorites Only
 import json
-from databricks.sdk import WorkspaceClient
-
-w = WorkspaceClient()
 
 favorite_repos = [r for r in repos if r["is_favorite"]]
 print(f"Found {len(favorite_repos)} favorite repos for AI processing")
@@ -351,36 +348,19 @@ Respond ONLY with valid JSON, no markdown formatting."""
 
 
 def call_foundation_model(prompt: str) -> dict:
-    """Call Databricks Foundation Model API for AI insights."""
-    import requests
+    """Call a Foundation Model using Databricks ai_query()."""
+    result_df = spark.sql("""
+        SELECT ai_query(
+            'databricks-meta-llama-3-1-70b-instruct',
+            CONCAT(
+                'You are a senior software engineer analyzing GitHub repositories. '
+                'Always respond with valid JSON only, no markdown formatting.\n\n',
+                :prompt
+            )
+        ) AS response
+    """, args={"prompt": prompt})
 
-    # Use the serving endpoint for a foundation model
-    # This uses the Databricks workspace's built-in model serving
-    workspace_url = spark.conf.get("spark.databricks.workspaceUrl", "")
-    token = dbutils.notebook.entry_point.getDbutils().notebook().getContext().apiToken().get()
-
-    # Use databricks-meta-llama-3-1-70b-instruct or similar available model
-    endpoint = f"https://{workspace_url}/serving-endpoints/databricks-meta-llama-3-1-70b-instruct/invocations"
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-
-    payload = {
-        "messages": [
-            {"role": "system", "content": "You are a senior software engineer analyzing GitHub repositories. Always respond with valid JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        "max_tokens": 1000,
-        "temperature": 0.3,
-    }
-
-    response = requests.post(endpoint, json=payload, headers=headers, timeout=60)
-    response.raise_for_status()
-
-    result = response.json()
-    content = result["choices"][0]["message"]["content"]
+    content = result_df.collect()[0]["response"]
 
     # Parse the JSON response (strip markdown code fences if present)
     content = content.strip()
