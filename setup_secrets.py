@@ -15,32 +15,24 @@ from databricks.sdk import WorkspaceClient
 from databricks.sdk.service import workspace
 import getpass
 
-w = WorkspaceClient()
-
-w.secrets.create_scope(scope="database")
-w.secrets.put_secret(
-    scope="database",
-    key="lakebase-url",
-    string_value=getpass.getpass("Paste your Lakebase URL: ")
-)
-
-w.secrets.put_acl(
-    scope="database",
-    principal="users",
-    permission=workspace.AclPermission.READ,
-)
-
-github_token = getpass.getpass(
-    "Paste your GitHub personal access token (optional, press Enter to skip): "
-)
-if github_token:
-    w.secrets.create_scope(scope="github")
-    w.secrets.put_secret(scope="github", key="token", string_value=github_token)
-    w.secrets.put_acl(
-        scope="github",
-        principal="users",
-        permission=workspace.AclPermission.READ,
-    )
-    print("Stored GitHub token in scope 'github', key 'token'.")
+username = ''
+if not username:
+    print('please enter your username')
 else:
-    print("Skipped GitHub token - app will use unauthenticated GitHub API requests.")
+    w = WorkspaceClient()
+
+    github_token = getpass.getpass(
+        "Paste your GitHub personal access token (optional, press Enter to skip): "
+    )
+    if github_token:
+        # w.secrets.create_scope(scope="github")
+        w.secrets.put_secret(scope="github", key=username, string_value=github_token)
+        w.secrets.put_acl(
+            scope="github",
+            principal="users",
+            permission=workspace.AclPermission.READ,
+        )
+        print("Stored GitHub token in scope 'github', key ." + username)
+        print("use databricks secrets for that")
+    else:
+        print("Skipped GitHub token - app will use unauthenticated GitHub API requests.")

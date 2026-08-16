@@ -1,9 +1,3 @@
-# Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "5"
-# ///
-# DBTITLE 1,Traverse GitHub repo graph
 import json
 import base64
 import time
@@ -111,7 +105,7 @@ def fetch_all_for_repos(iterator):
                 dep_files = [
                     e for e in tree_entries
                     if e.get("type") == "blob"
-                    and e["path"].rsplit("/", 1)[-1] in DEPENDENCY_FILENAMES
+                       and e["path"].rsplit("/", 1)[-1] in DEPENDENCY_FILENAMES
                 ]
 
                 for entry in dep_files:
@@ -672,13 +666,13 @@ Rules:
 def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
     """
     Use ai_query to analyze dependency files and discover related repos.
-    
+
     Strategy:
     1. Read dependency file contents from staging
     2. Group by source repo, batch into AI prompts
     3. AI suggests specific owner/repo names
     4. Validate suggestions exist via GitHub API (1 call each, but only for new repos)
-    
+
     Rate-limit aware: validates at most 50 suggestions per hop to conserve API budget.
     """
     global _github_request_count
@@ -731,18 +725,18 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
             if response_text.startswith("```"):
                 response_text = response_text.split("\n", 1)[1]
                 response_text = response_text.rsplit("```", 1)[0]
-            
+
             suggested_repos = json.loads(response_text)
-            
+
             if isinstance(suggested_repos, list):
                 for suggested in suggested_repos:
-                    if (isinstance(suggested, str) 
-                        and "/" in suggested 
-                        and suggested not in already_seen):
+                    if (isinstance(suggested, str)
+                            and "/" in suggested
+                            and suggested not in already_seen):
                         ai_suggestions.append((source_repo, suggested))
                         # Record the dependency edge regardless of validation
                         record_edge(source_repo, suggested, "dependency",
-                                   {"discovered_by": "ai_query"})
+                                    {"discovered_by": "ai_query"})
 
         except Exception as e:
             print(f"    ⚠ AI analysis failed for {source_repo}: {e}")
@@ -755,7 +749,7 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
     # Limit validations to conserve API budget
     max_validations = min(50, MAX_GITHUB_REQUESTS_PER_RUN - _github_request_count)
     validated = []
-    
+
     # Deduplicate suggestions
     seen_suggestions = set()
     unique_suggestions = []
@@ -778,7 +772,7 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
             already_seen.add(suggested_repo)
             # Update the edge to mark it as validated
             record_edge(source, suggested_repo, "ai_suggested",
-                       {"validated": True, "source_type": "dependency_analysis"})
+                        {"validated": True, "source_type": "dependency_analysis"})
         except Exception:
             _github_request_count += 1
             # Repo doesn't exist or is private - skip silently
@@ -847,10 +841,10 @@ for hop in range(1, MAX_HOPS + 1):
         committer_repos.append(repo)
         source_repo = committer_to_source_repo.get(username, "unknown")
         record_edge(username, repo, "committer",
-                   {"source_repo": source_repo})
+                    {"source_repo": source_repo})
         # Also record repo->repo via shared committer
         record_edge(source_repo, repo, "shared_committer",
-                   {"via_committer": username})
+                    {"via_committer": username})
 
     print(f"  ✓ Committer discovery found {len(committer_repos)} new repos")
 
@@ -894,6 +888,3 @@ result = {
 }
 print(result)
 dbutils.notebook.exit(json.dumps(result))
-
-# COMMAND ----------
-
