@@ -48,6 +48,7 @@ FETCH_MODE = dbutils.widgets.get("fetch_mode")
 repos_history_table = f"{catalog}.{schema}.lb_github_repos_history"
 github_staging_table = f"{catalog}.{schema}.github_api_staging"
 graph_edges_table = f"{catalog}.{schema}.github_graph_edges"
+ai_query_cache_table = f"{catalog}.{schema}.ai_query_cache"
 
 # Budget: GitHub REST API = 5000 req/hr. Track usage to avoid blowing the limit.
 MAX_GITHUB_REQUESTS_PER_RUN = 4000
@@ -555,8 +556,8 @@ Rules:
 - ONLY suggest repos you are confident exist on GitHub in "owner/repo" format
 - Focus on the most significant/popular dependencies, skip trivial ones
 - Do NOT suggest the source repo itself
-- Respond ONLY with a JSON array of strings, e.g.: ["owner/repo1", "owner/repo2"]
-- If you cannot determine any repos, respond with: []"""
+- Respond ONLY with a JSON object mapping package names to repos, e.g.: {"package1": "owner/repo1", "package2": "owner/repo2"}
+- If you cannot determine any repos, respond with: {}"""
 
 
 def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
@@ -585,16 +586,36 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
         if content:
             repo_deps.setdefault(repo, []).append(f"### {row['path']}\n```\n{content}\n```")
 
-    # Analyze up to 10 repos per hop
+    # Analyze up to 10 repos per hop (with caching)
     ai_suggestions = []
     for source_repo, dep_files in list(repo_deps.items())[:10]:
+        # Check cache first — if we already have mappings for this source_repo, reuse them
+        try:
+            cached_df = spark.sql(
+                "SELECT package_name, suggested_repo FROM {} WHERE source_repo = :repo".format(ai_query_cache_table),
+                args={"repo": source_repo},
+            )
+            cached_rows = cached_df.collect()
+        except Exception:
+            cached_rows = []
+
+        if cached_rows:
+            print(f"    ✓ Cache hit for {source_repo} ({len(cached_rows)} mappings)")
+            for row in cached_rows:
+                suggested = row["suggested_repo"]
+                if "/" in suggested and suggested not in already_seen:
+                    ai_suggestions.append((source_repo, suggested))
+                    record_edge(source_repo, suggested, "dependency", {"discovered_by": "ai_query_cache"})
+            continue
+
+        # No cache — call ai_query
         prompt = _AI_DEPENDENCY_PROMPT.format(
             source_repo=source_repo,
             dep_contents="\n\n".join(dep_files),
         )
         try:
             result_df = spark.sql(
-                "SELECT ai_query('databricks-meta-llama-3-1-70b-instruct', :prompt) AS response",
+                "SELECT ai_query('databricks-meta-llama-3-3-70b-instruct', :prompt) AS response",
                 args={"prompt": prompt},
             )
             response_text = result_df.collect()[0]["response"].strip()
@@ -603,9 +624,22 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
             if response_text.startswith("```"):
                 response_text = response_text.split("\n", 1)[1].rsplit("```", 1)[0]
 
-            suggested_repos = json.loads(response_text)
-            if isinstance(suggested_repos, list):
-                for suggested in suggested_repos:
+            suggested_map = json.loads(response_text)
+            if isinstance(suggested_map, dict):
+                # Write package→repo mappings to cache
+                cache_rows = [
+                    (source_repo, pkg, repo, "databricks-meta-llama-3-3-70b-instruct")
+                    for pkg, repo in suggested_map.items()
+                    if isinstance(repo, str) and "/" in repo
+                ]
+                if cache_rows:
+                    cache_df = spark.createDataFrame(
+                        cache_rows,
+                        schema=["source_repo", "package_name", "suggested_repo", "model_name"],
+                    )
+                    cache_df.write.format("delta").mode("append").saveAsTable(ai_query_cache_table)
+
+                for pkg, suggested in suggested_map.items():
                     if isinstance(suggested, str) and "/" in suggested and suggested not in already_seen:
                         ai_suggestions.append((source_repo, suggested))
                         record_edge(source_repo, suggested, "dependency", {"discovered_by": "ai_query"})
