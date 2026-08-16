@@ -57,8 +57,12 @@
   </table>
 
   <hr style="margin-top:40px;">
-  <h2 style="font-size:18px;">🔗 Repo Graph</h2>
+  <h2 style="font-size:18px;">Repo Graph</h2>
   <p class="hint">Relationships discovered via graph traversal (committers + AI dependency analysis). Synced from Unity Catalog.</p>
+  <div id="repo-filter-indicator" style="display:none; margin-bottom:8px; font-size:13px; background:#e3f2fd; border-radius:4px; padding:6px 10px;">
+    Filtering graph by: <strong id="repo-filter-name"></strong>
+    <button onclick="clearRepoFilter()" style="margin-left:8px; cursor:pointer; background:none; border:none; color:#1565c0; font-size:13px;">✕ Clear</button>
+  </div>
 
   <div style="margin-bottom:12px;">
     <label for="edge-filter" style="display:inline; font-size:13px;">Filter by type:</label>
@@ -93,6 +97,7 @@
     const reposBody = document.getElementById("repos-body");
     const schemaWarning = document.getElementById("schema-warning");
     const schemaWarningDetail = document.getElementById("schema-warning-detail");
+    let activeRepoFilter = null;
 
     async function checkSchemaStatus() {
       try {
@@ -124,8 +129,11 @@
         reposBody.innerHTML = "";
         data.forEach((row) => {
           const tr = document.createElement("tr");
+          tr.style.cursor = "pointer";
+          if (activeRepoFilter === row.full_name) tr.style.background = "#e3f2fd";
           const favIcon = row.is_favorite ? "⭐" : "☆";
-          tr.innerHTML = `<td>${row.full_name}</td><td>${row.language || "-"}</td><td>${row.stargazers_count ?? "-"}</td><td>${row.open_issues_count ?? "-"}</td><td>${row.forks_count ?? "-"}</td><td><button class="fav-btn" onclick="toggleFav('${row.full_name}', ${!row.is_favorite})">${favIcon}</button></td><td><button class="del-btn" onclick="removeRepo('${row.full_name}')">✕</button></td>`;
+          tr.innerHTML = `<td>${row.full_name}</td><td>${row.language || "-"}</td><td>${row.stargazers_count ?? "-"}</td><td>${row.open_issues_count ?? "-"}</td><td>${row.forks_count ?? "-"}</td><td><button class="fav-btn" onclick="event.stopPropagation(); toggleFav('${row.full_name}', ${!row.is_favorite})">${favIcon}</button></td><td><button class="del-btn" onclick="event.stopPropagation(); removeRepo('${row.full_name}')">✕</button></td>`;
+          tr.addEventListener("click", () => setRepoFilter(row.full_name));
           reposBody.appendChild(tr);
         });
       } catch (err) {
@@ -184,6 +192,21 @@
       }
     });
 
+    function setRepoFilter(repoName) {
+      activeRepoFilter = repoName;
+      document.getElementById("repo-filter-indicator").style.display = "block";
+      document.getElementById("repo-filter-name").textContent = repoName;
+      loadRepos();
+      loadEdges();
+    }
+
+    function clearRepoFilter() {
+      activeRepoFilter = null;
+      document.getElementById("repo-filter-indicator").style.display = "none";
+      loadRepos();
+      loadEdges();
+    }
+
     async function loadEdgeStats() {
       try {
         const resp = await fetch("/graph/stats");
@@ -212,9 +235,13 @@
           }
           return;
         }
-        emptyMsg.style.display = data.length === 0 ? "block" : "none";
+        let filtered = data;
+        if (activeRepoFilter) {
+          filtered = data.filter(edge => edge.source === activeRepoFilter || edge.target === activeRepoFilter);
+        }
+        emptyMsg.style.display = filtered.length === 0 ? "block" : "none";
         edgesBody.innerHTML = "";
-        data.forEach((edge) => {
+        filtered.forEach((edge) => {
           const tr = document.createElement("tr");
           let details = "";
           if (edge.metadata) {
@@ -227,13 +254,7 @@
             } catch(e) { details = edge.metadata; }
           }
           const discovered = edge.discovered_at ? new Date(edge.discovered_at).toLocaleDateString() : "-";
-          const typeClass = {
-            "shared_committer": "🤝",
-            "committer": "👤",
-            "dependency": "📦",
-            "ai_suggested": "🤖",
-          }[edge.edge_type] || "🔗";
-          tr.innerHTML = `<td><code>${edge.source}</code></td><td style="text-align:center;">→</td><td><code>${edge.target}</code></td><td>${typeClass} ${edge.edge_type}</td><td class="hint">${details}</td><td class="hint">${discovered}</td>`;
+          tr.innerHTML = `<td><code>${edge.source}</code></td><td style="text-align:center;">&rarr;</td><td><code>${edge.target}</code></td><td>${edge.edge_type}</td><td class="hint">${details}</td><td class="hint">${discovered}</td>`;
           edgesBody.appendChild(tr);
         });
       } catch (err) {
