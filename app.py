@@ -29,6 +29,9 @@ app.secret_key = os.environ.get("FLASK_SECRET_KEY") or os.urandom(32)
 # "owner/repo" shape check, e.g. "databricks/spark" or "sylph-ai/adal".
 _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
+# Feedback values supported by the API and enforced by the Lakebase table.
+_ALLOWED_FEEDBACK = {"bad", "good"}
+
 # Prefix applied to every student's Postgres schema name, e.g. username
 # "ada" -> schema "student_ada". Namespacing this way avoids a raw username
 # ever colliding with a system schema (public, pg_catalog, pg_toast, ...).
@@ -154,7 +157,10 @@ def schema_status():
     rows = lakebase.run_query(
         """
         SELECT table_name FROM information_schema.tables
-        WHERE table_schema = %s AND table_name IN ('github_repos', 'github_files')
+        WHERE table_schema = %s
+          AND table_name IN (
+              'github_repos', 'github_files', 'ai_suggestion_feedback'
+          )
         """,
         (schema,),
     )
@@ -171,6 +177,7 @@ def schema_status():
         "schema_exists": len(schema_rows) > 0,
         "github_repos_exists": "github_repos" in existing_tables,
         "github_files_exists": "github_files" in existing_tables,
+        "ai_suggestion_feedback_exists": "ai_suggestion_feedback" in existing_tables,
     })
 
 
@@ -373,6 +380,78 @@ def get_graph_stats():
 
     total = sum(r["count"] for r in rows)
     return jsonify({"total_edges": total, "by_type": rows})
+
+
+@app.route("/graph/edges/feedback", methods=["POST"])
+def submit_graph_edge_feedback():
+    """Create or update feedback for one AI-suggested repository mapping."""
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({"error": "A JSON request body is required."}), 400
+
+    required_fields = ("source_repo", "package_name", "suggested_repo", "feedback")
+    values = {}
+    for field in required_fields:
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return jsonify({"error": f"{field} is required."}), 400
+        values[field] = value.strip()
+
+    for field in ("source_repo", "suggested_repo"):
+        if not _REPO_RE.fullmatch(values[field]):
+            return jsonify({
+                "error": f"Invalid {field} (expected owner/repo): {values[field]!r}"
+            }), 400
+
+    feedback = values["feedback"].lower()
+    if feedback not in _ALLOWED_FEEDBACK:
+        allowed = ", ".join(sorted(_ALLOWED_FEEDBACK))
+        return jsonify({"error": f"feedback must be one of: {allowed}."}), 400
+
+    reason = payload.get("reason")
+    if reason is not None and not isinstance(reason, str):
+        return jsonify({"error": "reason must be a string."}), 400
+    reason = reason.strip() if isinstance(reason, str) else None
+    if not reason:
+        reason = None
+
+    schema = _schema_for(username)
+    try:
+        row = lakebase.run_write_returning(
+            f"""
+            INSERT INTO {schema}.ai_suggestion_feedback
+                (source_repo, package_name, suggested_repo, feedback, reason)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (source_repo, package_name, suggested_repo) DO UPDATE
+                SET feedback = EXCLUDED.feedback,
+                    reason = EXCLUDED.reason,
+                    created_at = now()
+            RETURNING id, source_repo, package_name, suggested_repo,
+                      feedback, reason, created_at
+            """,
+            (
+                values["source_repo"],
+                values["package_name"],
+                values["suggested_repo"],
+                feedback,
+                reason,
+            ),
+        )
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return jsonify({
+                "error": (
+                    "Feedback table not found. Run "
+                    "sql/create_ai_suggestion_feedback.sql first."
+                )
+            }), 404
+        raise
+
+    return jsonify(row)
 
 
 @app.route("/repos", methods=["DELETE"])

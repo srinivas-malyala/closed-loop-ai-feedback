@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <title>GitHub Repo Explorer</title>
   <style>
-    body { font-family: -apple-system, Arial, sans-serif; max-width: 720px; margin: 60px auto; color: #222; }
+    body { font-family: -apple-system, Arial, sans-serif; max-width: 960px; margin: 60px auto; color: #222; }
     h1 { font-size: 20px; }
     label { display: block; margin-top: 16px; font-weight: 600; }
     input[type="text"] { width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box; }
@@ -16,6 +16,17 @@
     th { font-size: 13px; color: #555; text-transform: uppercase; }
     .fav-btn { cursor: pointer; background: none; border: none; font-size: 18px; padding: 0 4px; }
     .del-btn { cursor: pointer; background: none; border: none; font-size: 14px; color: #b00020; padding: 0 4px; }
+    .feedback-btn { margin: 0; padding: 5px 9px; border: 1px solid #b00020; border-radius: 4px; background: #fff; color: #b00020; white-space: nowrap; }
+    .feedback-btn:hover { background: #fff1f2; }
+    #feedback-status { display: none; margin: 12px 0; padding: 10px 12px; border-radius: 6px; font-size: 13px; }
+    #feedback-status.success { display: block; color: #155724; background: #d4edda; border: 1px solid #c3e6cb; }
+    #feedback-status.error { display: block; color: #721c24; background: #f8d7da; border: 1px solid #f5c6cb; }
+    dialog { width: min(440px, calc(100% - 40px)); border: 1px solid #ccc; border-radius: 8px; padding: 22px; box-shadow: 0 12px 36px rgba(0, 0, 0, 0.2); }
+    dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+    dialog h3 { margin-top: 0; }
+    dialog textarea { width: 100%; min-height: 80px; padding: 8px; margin-top: 6px; box-sizing: border-box; resize: vertical; }
+    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+    .dialog-actions button { margin-top: 0; }
   </style>
 </head>
 <body>
@@ -28,7 +39,7 @@
   <div id="schema-warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; border-radius:6px; padding:12px; margin-bottom:20px;">
     <strong>⚠️ Schema setup incomplete.</strong>
     <span id="schema-warning-detail"></span>
-    <p style="margin:8px 0 0; font-size:13px;">Run the SQL files in the <code>sql/</code> folder to create your schema and tables. See <code>sql/create_student_schema.sql</code>, <code>sql/create_github_repos.sql</code>, and <code>sql/create_github_files.sql</code>.</p>
+    <p style="margin:8px 0 0; font-size:13px;">Run the SQL files in the <code>sql/</code> folder to create your schema and tables, including <code>sql/create_ai_suggestion_feedback.sql</code> for graph feedback.</p>
   </div>
 
   <p class="hint">Enter an "owner/repo" name. This fetches stats from GitHub and adds it to your <code>github_repos</code> table.</p>
@@ -74,6 +85,8 @@
     <span id="edge-stats" style="margin-left:16px; font-size:13px; color:#555;"></span>
   </div>
 
+  <div id="feedback-status" role="status" aria-live="polite"></div>
+
   <table id="edges-table">
     <thead>
       <tr>
@@ -83,11 +96,31 @@
         <th>Type</th>
         <th>Details</th>
         <th>Discovered</th>
+        <th>Feedback</th>
       </tr>
     </thead>
     <tbody id="edges-body"></tbody>
   </table>
   <p id="edges-empty" class="hint" style="display:none;">No graph edges found. Run the graph traversal notebook and sync the table to Lakebase.</p>
+
+  <dialog id="feedback-dialog" aria-labelledby="feedback-dialog-title">
+    <form id="feedback-form">
+      <h3 id="feedback-dialog-title">Mark AI suggestion as bad</h3>
+      <p class="hint">
+        <code id="feedback-source"></code> suggested
+        <code id="feedback-target"></code>.
+      </p>
+      <label for="feedback-package">Dependency/package</label>
+      <input type="text" id="feedback-package" name="package_name" required>
+      <p class="hint">Enter the package that led the AI to this repository. It is required so the pipeline can block the exact cached mapping.</p>
+      <label for="feedback-reason">Reason (optional)</label>
+      <textarea id="feedback-reason" name="reason" placeholder="For example: Repo is archived or unrelated"></textarea>
+      <div class="dialog-actions">
+        <button type="button" id="feedback-cancel">Cancel</button>
+        <button type="submit" id="feedback-submit">Submit feedback</button>
+      </div>
+    </form>
+  </dialog>
 
   <script>
     const form = document.getElementById("repo-form");
@@ -95,7 +128,12 @@
     const reposBody = document.getElementById("repos-body");
     const schemaWarning = document.getElementById("schema-warning");
     const schemaWarningDetail = document.getElementById("schema-warning-detail");
+    const feedbackDialog = document.getElementById("feedback-dialog");
+    const feedbackForm = document.getElementById("feedback-form");
+    const feedbackStatus = document.getElementById("feedback-status");
+    const feedbackSubmit = document.getElementById("feedback-submit");
     let activeRepoFilter = null;
+    let feedbackEdge = null;
 
     async function checkSchemaStatus() {
       try {
@@ -107,6 +145,7 @@
         if (!data.schema_exists) missing.push("schema " + data.schema);
         if (!data.github_repos_exists) missing.push("table github_repos");
         if (!data.github_files_exists) missing.push("table github_files");
+        if (!data.ai_suggestion_feedback_exists) missing.push("table ai_suggestion_feedback");
 
         if (missing.length > 0) {
           schemaWarningDetail.textContent = " Missing: " + missing.join(", ") + ".";
@@ -242,22 +281,109 @@
         filtered.forEach((edge) => {
           const tr = document.createElement("tr");
           let details = "";
+          let metadata = {};
           if (edge.metadata) {
             try {
-              const meta = JSON.parse(edge.metadata);
-              if (meta.source_repo) details = `from ${meta.source_repo}`;
-              else if (meta.validated) details = "✓ validated";
-              else details = Object.entries(meta).map(([k,v]) => `${k}: ${v}`).join(", ");
+              metadata = typeof edge.metadata === "string" ? JSON.parse(edge.metadata) : edge.metadata;
+              if (metadata.source_repo) details = `from ${metadata.source_repo}`;
+              else if (metadata.validated) details = "✓ validated";
+              else details = Object.entries(metadata).map(([k,v]) => `${k}: ${v}`).join(", ");
             } catch(e) { details = edge.metadata; }
           }
           const discovered = edge.discovered_at ? new Date(edge.discovered_at).toLocaleDateString() : "-";
-          tr.innerHTML = `<td><code>${edge.source}</code></td><td style="text-align:center;">&rarr;</td><td><code>${edge.target}</code></td><td>${edge.edge_type}</td><td class="hint">${details}</td><td class="hint">${discovered}</td>`;
+
+          const appendCell = (value, className = "") => {
+            const td = document.createElement("td");
+            td.textContent = value;
+            if (className) td.className = className;
+            tr.appendChild(td);
+            return td;
+          };
+
+          const sourceCell = appendCell("");
+          const sourceCode = document.createElement("code");
+          sourceCode.textContent = edge.source;
+          sourceCell.appendChild(sourceCode);
+          const arrowCell = appendCell("→");
+          arrowCell.style.textAlign = "center";
+          const targetCell = appendCell("");
+          const targetCode = document.createElement("code");
+          targetCode.textContent = edge.target;
+          targetCell.appendChild(targetCode);
+          appendCell(edge.edge_type);
+          appendCell(details, "hint");
+          appendCell(discovered, "hint");
+
+          const actionCell = appendCell("");
+          if (edge.edge_type === "ai_suggested") {
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "feedback-btn";
+            button.textContent = "Mark as Bad";
+            button.addEventListener("click", () => openFeedbackDialog(edge, metadata));
+            actionCell.appendChild(button);
+          } else {
+            actionCell.textContent = "–";
+          }
           edgesBody.appendChild(tr);
         });
       } catch (err) {
         emptyMsg.style.display = "block";
       }
     }
+
+    function openFeedbackDialog(edge, metadata) {
+      feedbackEdge = edge;
+      document.getElementById("feedback-source").textContent = edge.source;
+      document.getElementById("feedback-target").textContent = edge.target;
+      document.getElementById("feedback-package").value = metadata.package_name || "";
+      document.getElementById("feedback-reason").value = "";
+      feedbackDialog.showModal();
+      document.getElementById("feedback-package").focus();
+    }
+
+    document.getElementById("feedback-cancel").addEventListener("click", () => {
+      feedbackDialog.close();
+    });
+
+    feedbackForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (!feedbackEdge) return;
+
+      feedbackSubmit.disabled = true;
+      feedbackSubmit.textContent = "Submitting...";
+      feedbackStatus.className = "";
+
+      try {
+        const resp = await fetch("/graph/edges/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            source_repo: feedbackEdge.source,
+            package_name: document.getElementById("feedback-package").value,
+            suggested_repo: feedbackEdge.target,
+            feedback: "bad",
+            reason: document.getElementById("feedback-reason").value,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          throw new Error(data.error || resp.statusText);
+        }
+
+        feedbackDialog.close();
+        feedbackStatus.textContent = `Feedback saved: ${data.suggested_repo} was marked as bad for ${data.package_name}.`;
+        feedbackStatus.className = "success";
+        feedbackEdge = null;
+      } catch (err) {
+        feedbackStatus.textContent = "Could not save feedback: " + err.message;
+        feedbackStatus.className = "error";
+        feedbackDialog.close();
+      } finally {
+        feedbackSubmit.disabled = false;
+        feedbackSubmit.textContent = "Submit feedback";
+      }
+    });
 
     checkSchemaStatus();
     loadRepos();
