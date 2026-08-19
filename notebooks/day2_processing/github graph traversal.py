@@ -488,12 +488,13 @@ Rules:
 - ONLY suggest repos you are confident exist on GitHub in "owner/repo" format
 - Focus on the most significant/popular dependencies, skip trivial ones
 - Do NOT suggest the source repo itself
+{feedback_rules}
 - Respond ONLY with a JSON object mapping package names to repos, e.g.: {{"package1": "owner/repo1", "package2": "owner/repo2"}}
 - If you cannot determine any repos, respond with: {{}}"""
 
 
 def load_blocked_ai_suggestions():
-    """Load current bad-feedback mappings and remove them from the AI cache."""
+    """Load current bad feedback and invalidate affected source-repo caches."""
     try:
         blocked_df = spark.sql(f"""
             WITH latest_feedback AS (
@@ -531,22 +532,31 @@ def load_blocked_ai_suggestions():
     invalidated_sources = set()
     try:
         if spark.catalog.tableExists(ai_query_cache_table):
+            blocked_cache_df = spark.table(ai_query_cache_table).join(
+                blocked_df,
+                # A reviewer may not know the AI's exact package key. The
+                # source and suggested repo identify the rejected edge.
+                on=["source_repo", "suggested_repo"],
+                how="inner",
+            )
             invalidated_sources = {
                 row["source_repo"]
-                for row in spark.table(ai_query_cache_table).join(
-                    blocked_df,
-                    on=["source_repo", "package_name", "suggested_repo"],
-                    how="inner",
-                ).select("source_repo").distinct().collect()
+                for row in blocked_cache_df.select("source_repo").distinct().collect()
             }
-            from delta.tables import DeltaTable
-            DeltaTable.forName(spark, ai_query_cache_table).alias("cache").merge(
-                blocked_df.alias("blocked"),
-                "cache.source_repo = blocked.source_repo AND "
-                "cache.package_name = blocked.package_name AND "
-                "cache.suggested_repo = blocked.suggested_repo",
-            ).whenMatchedDelete().execute()
-            print(f"    ✓ Removed {len(blocked_set)} blocked mapping(s) from the AI query cache")
+            if invalidated_sources:
+                invalidated_source_df = spark.createDataFrame(
+                    [(source_repo,) for source_repo in sorted(invalidated_sources)],
+                    schema=["source_repo"],
+                )
+                from delta.tables import DeltaTable
+                DeltaTable.forName(spark, ai_query_cache_table).alias("cache").merge(
+                    invalidated_source_df.alias("invalidated"),
+                    "cache.source_repo = invalidated.source_repo",
+                ).whenMatchedDelete().execute()
+                print(
+                    f"    ✓ Invalidated AI cache for {len(invalidated_sources)} "
+                    "source repo(s) with new bad feedback"
+                )
     except Exception as e:
         # Keep enforcing the in-memory block even if cache cleanup fails.
         print(f"    ⚠ Could not remove blocked mappings from {ai_query_cache_table}: {e}")
@@ -585,6 +595,9 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
     global _github_request_count
 
     blocked_set, invalidated_sources = load_blocked_ai_suggestions()
+    blocked_repos_by_source = {}
+    for source_repo, _, suggested_repo in blocked_set:
+        blocked_repos_by_source.setdefault(source_repo, set()).add(suggested_repo)
 
     dep_contents_df = staging_df.filter(
         "category = 'content' AND path IN ('package.json', 'requirements.txt', 'setup.py', "
@@ -605,9 +618,14 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
         if content:
             repo_deps.setdefault(repo, []).append(f"### {row['path']}\n```\n{content}\n```")
 
-    # Analyze up to 10 repos per hop (with caching)
+    # Analyze up to 10 repos per hop (with caching). Sources invalidated by
+    # fresh human feedback go first so this run performs the replacement query.
+    repo_items = list(repo_deps.items())
+    repo_items.sort(key=lambda item: item[0] not in invalidated_sources)
     ai_suggestions = []
-    for source_repo, dep_files in list(repo_deps.items())[:10]:
+    for source_repo, dep_files in repo_items[:10]:
+        blocked_repos = blocked_repos_by_source.get(source_repo, set())
+
         # Check cache first — if we already have mappings for this source_repo, reuse them
         try:
             cached_df = spark.sql(
@@ -620,7 +638,7 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
 
         cached_rows = [
             row for row in cached_rows
-            if (source_repo, row["package_name"], row["suggested_repo"]) not in blocked_set
+            if row["suggested_repo"] not in blocked_repos
         ]
         if source_repo in invalidated_sources:
             # A rejected mapping invalidates this source's cache for this run, so
@@ -631,16 +649,37 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
         if cached_rows:
             print(f"    ✓ Cache hit for {source_repo} ({len(cached_rows)} mappings)")
             for row in cached_rows:
+                package_name = row["package_name"]
                 suggested = row["suggested_repo"]
                 if "/" in suggested and suggested not in already_seen:
-                    ai_suggestions.append((source_repo, suggested))
-                    record_edge(source_repo, suggested, "dependency", {"discovered_by": "ai_query_cache"})
+                    ai_suggestions.append((source_repo, package_name, suggested))
+                    record_edge(
+                        source_repo,
+                        suggested,
+                        "dependency",
+                        {
+                            "discovered_by": "ai_query_cache",
+                            "package_name": package_name,
+                        },
+                    )
             continue
 
         # No cache — call ai_query
+        feedback_rules = ""
+        if blocked_repos:
+            feedback_rules = "\n".join(
+                f'- Do NOT suggest "{repo}"; a human reviewer marked it as bad.'
+                for repo in sorted(blocked_repos)
+            )
+            print(
+                f"    ↻ Re-querying {source_repo} with "
+                f"{len(blocked_repos)} human-feedback exclusion(s)"
+            )
+
         prompt = _AI_DEPENDENCY_PROMPT.format(
             source_repo=source_repo,
             dep_contents="\n\n".join(dep_files),
+            feedback_rules=feedback_rules,
         )
         try:
             result_df = spark.sql(
@@ -661,7 +700,7 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
                     if isinstance(pkg, str)
                     and isinstance(repo, str)
                     and "/" in repo
-                    and (source_repo, pkg, repo) not in blocked_set
+                    and repo not in blocked_repos
                 ]
                 suppressed_count = len(suggested_map) - len(allowed_suggestions)
                 if suppressed_count:
@@ -676,8 +715,13 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
 
                 for pkg, suggested in allowed_suggestions:
                     if suggested not in already_seen:
-                        ai_suggestions.append((source_repo, suggested))
-                        record_edge(source_repo, suggested, "dependency", {"discovered_by": "ai_query"})
+                        ai_suggestions.append((source_repo, pkg, suggested))
+                        record_edge(
+                            source_repo,
+                            suggested,
+                            "dependency",
+                            {"discovered_by": "ai_query", "package_name": pkg},
+                        )
         except Exception as e:
             print(f"    ⚠ AI analysis failed for {source_repo}: {e}")
 
@@ -689,15 +733,15 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
     max_validations = min(50, MAX_GITHUB_REQUESTS_PER_RUN - _github_request_count)
     seen_suggestions = set()
     unique_suggestions = []
-    for source, target in ai_suggestions:
+    for source, package_name, target in ai_suggestions:
         if target not in seen_suggestions and target not in already_seen:
             seen_suggestions.add(target)
-            unique_suggestions.append((source, target))
+            unique_suggestions.append((source, package_name, target))
 
     print(f"    AI suggested {len(unique_suggestions)} unique new repos, validating up to {max_validations}...")
 
     validated = []
-    for source, suggested_repo in unique_suggestions[:max_validations]:
+    for source, package_name, suggested_repo in unique_suggestions[:max_validations]:
         if len(already_seen) >= TARGET_REPOS:
             break
         try:
@@ -706,7 +750,12 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
             time.sleep(API_DELAY_SECONDS)
             validated.append(suggested_repo)
             already_seen.add(suggested_repo)
-            record_edge(source, suggested_repo, "ai_suggested", {"validated": True})
+            record_edge(
+                source,
+                suggested_repo,
+                "ai_suggested",
+                {"validated": True, "package_name": package_name},
+            )
         except Exception:
             _github_request_count += 1
 

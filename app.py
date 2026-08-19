@@ -454,6 +454,36 @@ def submit_graph_edge_feedback():
     return jsonify(row)
 
 
+@app.route("/graph/edges/feedback", methods=["GET"])
+def get_graph_edge_feedback():
+    """Return the signed-in student's feedback history from Lakebase."""
+    username = _current_username()
+    if not username:
+        return jsonify({"error": "Not signed in"}), 401
+
+    schema = _schema_for(username)
+    try:
+        rows = lakebase.run_query(
+            f"""
+            SELECT id, source_repo, package_name, suggested_repo,
+                   feedback, reason, created_at
+            FROM {schema}.ai_suggestion_feedback
+            ORDER BY created_at DESC, id DESC
+            """
+        )
+    except Exception as exc:
+        if "does not exist" in str(exc):
+            return jsonify({
+                "error": (
+                    "Feedback table not found. Run "
+                    "sql/create_ai_suggestion_feedback.sql first."
+                )
+            }), 404
+        raise
+
+    return jsonify(rows)
+
+
 @app.route("/repos", methods=["DELETE"])
 def remove_repo():
     """

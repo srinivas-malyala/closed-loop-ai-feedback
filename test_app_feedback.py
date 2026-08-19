@@ -132,3 +132,59 @@ def test_feedback_returns_404_when_table_is_missing(client, monkeypatch):
 
     assert response.status_code == 404
     assert "Feedback table not found" in response.get_json()["error"]
+
+
+def test_feedback_history_requires_sign_in(client):
+    response = client.get("/graph/edges/feedback")
+    assert response.status_code == 401
+
+
+def test_index_includes_feedback_history_view(client):
+    _sign_in(client)
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b'id="feedback-history-section"' in response.data
+    assert b'id="feedback-history-body"' in response.data
+    assert b'id="refresh-feedback-history"' in response.data
+
+
+def test_feedback_history_returns_latest_rows(client, monkeypatch):
+    _sign_in(client)
+    returned = [{
+        "id": 7,
+        "source_repo": "facebook/react",
+        "package_name": "loose-envify",
+        "suggested_repo": "zertosh/loose-envify",
+        "feedback": "bad",
+        "reason": "Repo is archived",
+        "created_at": "2026-08-18T12:00:00Z",
+    }]
+    captured = {}
+
+    def fake_query(sql, params=None):
+        captured["sql"] = sql
+        captured["params"] = params
+        return returned
+
+    monkeypatch.setattr(app_module.lakebase, "run_query", fake_query)
+    response = client.get("/graph/edges/feedback")
+
+    assert response.status_code == 200
+    assert response.get_json() == returned
+    assert "FROM student_sri.ai_suggestion_feedback" in captured["sql"]
+    assert "ORDER BY created_at DESC, id DESC" in captured["sql"]
+    assert captured["params"] is None
+
+
+def test_feedback_history_returns_404_when_table_is_missing(client, monkeypatch):
+    _sign_in(client)
+
+    def missing_table(*args, **kwargs):
+        raise RuntimeError('relation "student_sri.ai_suggestion_feedback" does not exist')
+
+    monkeypatch.setattr(app_module.lakebase, "run_query", missing_table)
+    response = client.get("/graph/edges/feedback")
+
+    assert response.status_code == 404
+    assert "Feedback table not found" in response.get_json()["error"]

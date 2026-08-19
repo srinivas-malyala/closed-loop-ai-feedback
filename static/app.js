@@ -10,7 +10,15 @@ const feedbackDialog = bootstrap.Modal.getOrCreateInstance(feedbackDialogEl);
 const feedbackForm = document.getElementById("feedback-form");
 const feedbackStatus = document.getElementById("feedback-status");
 const feedbackSubmit = document.getElementById("feedback-submit");
+const feedbackHistoryBody = document.getElementById("feedback-history-body");
+const feedbackHistoryEmpty = document.getElementById("feedback-history-empty");
+const feedbackHistoryStatus = document.getElementById("feedback-history-status");
+const refreshFeedbackHistoryButton = document.getElementById("refresh-feedback-history");
 const numberFormatter = new Intl.NumberFormat();
+const dateTimeFormatter = new Intl.DateTimeFormat(undefined, {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
 
 let activeRepoFilter = null;
 let feedbackEdge = null;
@@ -356,11 +364,79 @@ async function loadEdges() {
 
 document.getElementById("edge-filter").addEventListener("change", loadEdges);
 
+function formatDateTime(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : dateTimeFormatter.format(date);
+}
+
+function renderFeedbackHistory(entries) {
+  feedbackHistoryBody.replaceChildren();
+  feedbackHistoryEmpty.style.display = entries.length ? "none" : "block";
+  document.getElementById("feedback-history-count").textContent = numberFormatter.format(entries.length);
+  document.getElementById("feedback-history-freshness").textContent = "Updated just now from Lakebase";
+
+  entries.forEach((entry) => {
+    const row = document.createElement("tr");
+    appendTextCell(row, entry.source_repo, "graph-repo");
+    const arrowCell = appendCell(row, "connection-arrow");
+    arrowCell.innerHTML = '<i class="bi bi-arrow-right" aria-hidden="true"></i>';
+    appendTextCell(row, entry.suggested_repo, "graph-repo");
+    appendTextCell(row, entry.package_name, "history-package");
+
+    const statusCell = appendCell(row);
+    const status = document.createElement("span");
+    status.className = `feedback-state feedback-state-${entry.feedback}`;
+    status.innerHTML = entry.feedback === "bad"
+      ? '<i class="bi bi-hand-thumbs-down-fill" aria-hidden="true"></i> Bad'
+      : '<i class="bi bi-hand-thumbs-up-fill" aria-hidden="true"></i> Good';
+    statusCell.appendChild(status);
+
+    appendTextCell(row, entry.reason || "No reason provided", "history-reason d-none d-lg-table-cell");
+    appendTextCell(row, formatDateTime(entry.created_at), "text-secondary d-none d-md-table-cell text-nowrap");
+    feedbackHistoryBody.appendChild(row);
+  });
+}
+
+async function loadFeedbackHistory() {
+  hideAlert(feedbackHistoryStatus);
+  refreshFeedbackHistoryButton.disabled = true;
+  refreshFeedbackHistoryButton.querySelector("i")?.classList.add("spin");
+
+  try {
+    const response = await fetch("/graph/edges/feedback");
+    const data = await readJson(response);
+    if (!response.ok) throw new Error(data.error || response.statusText);
+    renderFeedbackHistory(data);
+  } catch (error) {
+    feedbackHistoryBody.replaceChildren();
+    feedbackHistoryEmpty.style.display = "none";
+    document.getElementById("feedback-history-count").textContent = "—";
+    document.getElementById("feedback-history-freshness").textContent = "Feedback history unavailable";
+    showAlert(feedbackHistoryStatus, `Could not load feedback history: ${error.message}`, "danger");
+  } finally {
+    refreshFeedbackHistoryButton.disabled = false;
+    refreshFeedbackHistoryButton.querySelector("i")?.classList.remove("spin");
+  }
+}
+
+refreshFeedbackHistoryButton.addEventListener("click", loadFeedbackHistory);
+
 function openFeedbackDialog(edge, metadata) {
   feedbackEdge = edge;
   document.getElementById("feedback-source").textContent = edge.source;
   document.getElementById("feedback-target").textContent = edge.target;
-  document.getElementById("feedback-package").value = metadata.package_name || "";
+  const packageInput = document.getElementById("feedback-package");
+  const packageHelp = document.getElementById("feedback-package-help");
+  if (metadata.package_name) {
+    packageInput.value = metadata.package_name;
+    packageInput.readOnly = true;
+    packageHelp.textContent = "Resolved from the AI cache mapping for this edge.";
+  } else {
+    packageInput.value = edge.target.split("/").pop() || "";
+    packageInput.readOnly = false;
+    packageHelp.textContent = "Older edge metadata has no package key. You can correct this suggested value; blocking uses the source and target repositories.";
+  }
   document.getElementById("feedback-reason").value = "";
   feedbackDialog.show();
 }
@@ -404,6 +480,7 @@ feedbackForm.addEventListener("submit", async (event) => {
       `Feedback saved. ${data.suggested_repo} was marked as bad for ${data.package_name}.`,
       "success",
     );
+    await loadFeedbackHistory();
     feedbackEdge = null;
   } catch (error) {
     feedbackDialog.hide();
@@ -422,3 +499,4 @@ checkSchemaStatus();
 loadRepos();
 loadEdgeStats();
 loadEdges();
+loadFeedbackHistory();

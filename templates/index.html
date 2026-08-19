@@ -151,7 +151,7 @@
       </div>
     </section>
 
-    <section class="content-card" id="graph-section" aria-labelledby="graph-title">
+    <section class="content-card mb-4" id="graph-section" aria-labelledby="graph-title">
       <div class="card-heading graph-heading">
         <div>
           <span class="section-kicker">Dependency intelligence</span>
@@ -207,6 +207,54 @@
         <p>Run the graph traversal notebook and sync the results to Lakebase.</p>
       </div>
     </section>
+
+    <section class="content-card" id="feedback-history-section" aria-labelledby="feedback-history-title">
+      <div class="card-heading feedback-history-heading">
+        <div>
+          <span class="section-kicker">Human review</span>
+          <h2 id="feedback-history-title">Feedback history</h2>
+          <p>Previously reviewed AI mappings and their current feedback status.</p>
+        </div>
+        <div class="d-flex align-items-center gap-2">
+          <span class="source-badge"><i class="bi bi-database-check me-1"></i> Live from Lakebase</span>
+          <button type="button" class="btn btn-outline-secondary btn-sm rounded-pill" id="refresh-feedback-history">
+            <i class="bi bi-arrow-clockwise me-1" aria-hidden="true"></i>Refresh
+          </button>
+        </div>
+      </div>
+
+      <div class="history-summary" aria-live="polite">
+        <span><strong id="feedback-history-count">—</strong> submissions</span>
+        <span class="history-freshness" id="feedback-history-freshness">Loading latest feedback…</span>
+      </div>
+
+      <div id="feedback-history-status" class="alert mt-3 mb-0" role="status" aria-live="polite"></div>
+
+      <div class="table-responsive mt-3">
+        <table id="feedback-history-table" class="table app-table history-table align-middle mb-0">
+          <thead>
+            <tr>
+              <th scope="col">Source</th>
+              <th scope="col" class="connection-column"><span class="visually-hidden">Suggested</span></th>
+              <th scope="col">Suggested repository</th>
+              <th scope="col">Package</th>
+              <th scope="col">Status</th>
+              <th scope="col" class="d-none d-lg-table-cell">Reason</th>
+              <th scope="col" class="d-none d-md-table-cell">Submitted</th>
+            </tr>
+          </thead>
+          <tbody id="feedback-history-body">
+            <tr class="skeleton-row"><td colspan="7"><span></span></td></tr>
+            <tr class="skeleton-row"><td colspan="7"><span></span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="feedback-history-empty" class="empty-state">
+        <span><i class="bi bi-chat-square-heart"></i></span>
+        <h3>No feedback submitted yet</h3>
+        <p>Review an AI-suggested edge above and mark it as bad to start the feedback loop.</p>
+      </div>
+    </section>
   </main>
 
   <div class="modal fade" id="feedback-dialog" tabindex="-1" aria-labelledby="feedback-dialog-title" aria-hidden="true">
@@ -229,7 +277,7 @@
             <div class="mb-3">
               <label for="feedback-package" class="form-label">Dependency or package <span class="text-danger">*</span></label>
               <input type="text" class="form-control" id="feedback-package" name="package_name" placeholder="e.g. loose-envify" required>
-              <div class="form-text">This identifies the exact cached mapping the pipeline should improve.</div>
+              <div class="form-text" id="feedback-package-help">This identifies the dependency associated with the suggested edge.</div>
             </div>
             <div>
               <label for="feedback-reason" class="form-label">Why is this suggestion incorrect? <span class="text-secondary">Optional</span></label>
