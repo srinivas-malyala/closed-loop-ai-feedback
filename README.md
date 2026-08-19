@@ -35,9 +35,9 @@ flowchart LR
     traversal -->|Cache miss| ai[Databricks ai_query]
     ai -->|Package to repository mappings| traversal
     traversal <--> cache[("Delta - ai_query_cache")]
-    traversal --> graph[("Delta - github_api_staging and github_graph_edges")]
+    traversal --> graph_store[("Delta - github_api_staging and github_graph_edges")]
 
-    graph -->|Lakebase synced table| readmodel[("Lakebase read model - uc_github_graph_edges")]
+    graph_store -->|Lakebase synced table| readmodel[("Lakebase read model - uc_github_graph_edges")]
     readmodel -->|Graph and statistics| api
     api --> ui
 
