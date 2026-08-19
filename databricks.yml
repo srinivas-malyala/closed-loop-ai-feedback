@@ -1,4 +1,35 @@
+bundle:
+  name: week1-homework
+
 resources:
+  apps:
+    week1_homework:
+      name: week1-homework
+      description: >-
+        Closed-loop AI feedback app sourced from
+        https://github.com/srinivas-malyala/closed-loop-ai-feedback.
+      git_repository:
+        provider: gitHub
+        url: https://github.com/srinivas-malyala/closed-loop-ai-feedback
+      git_source:
+        branch: main
+        source_code_path: .
+      lifecycle:
+        started: true
+      resources:
+        - name: lakebase-url
+          description: Lakebase connection URL used by the application.
+          secret:
+            scope: database
+            key: lakebase-url
+            permission: READ
+        - name: token
+          description: Optional GitHub API token used by the application.
+          secret:
+            scope: github
+            key: token
+            permission: READ
+
   jobs:
     generate_repo_scd_on_change:
       name: "Generate Repo SCD (triggered by lb_github_repos_history)"
@@ -22,3 +53,10 @@ resources:
             base_parameters:
               catalog: "bootcamp"
               schema: "ltap_lab_day1"
+
+targets:
+  prod:
+    default: true
+    mode: production
+    workspace:
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}

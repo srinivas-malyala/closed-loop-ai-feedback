@@ -1,276 +1,359 @@
-# LTAP Lab: GitHub Repo Insights via Spark + Lakebase
+# Closed-Loop AI Feedback for GitHub Repository Discovery
 
-A Databricks App that demonstrates the full LTAP round trip, split across two
-lab days:
+RepoSignal is a Databricks reference implementation of a closed-loop Lakehouse
+application. Users manage a GitHub repository watchlist in a Databricks App,
+Spark expands those seeds into a dependency graph with `ai_query`, and human
+review feeds back into the next AI run so rejected suggestions are not reused.
 
-```
-Day 1: CDC / replication into Delta       Day 2: Graph traversal & discovery
-------------------------------------      ------------------------------------
-GitHub API --(ingest notebooks)-->        Watchlist (seed repos) --(multi-hop
-  Bronze Delta (raw repos + files)          graph crawl)--> github_api_staging
-                                             + github_graph_edges (Delta)
-                                                        |
-                                             (Databricks Synced Table, reverse ETL)
-                                                        v
-                                             Lakebase Postgres (read-only graph tables)
-                                                        |
-                                             Flask app  <-- also writes a personal
-                                                            watchlist table, and
-                                                            provisions per-student
-                                                            schemas on sign-in
-```
+The project demonstrates a practical LTAP pattern:
 
-**Day 1** is about landing raw GitHub data into Delta as faithfully as
-possible - full-snapshot replication into Bronze tables (`notebooks/day1_ingest/`).
-GitHub's REST API has no native CDC/webhook change stream for this lab's
-scope, so "replication" here means: re-fetch and overwrite/append the full
-snapshot each run, rather than row-level change capture.
+- **Lakebase Postgres** serves low-latency, per-user application state.
+- **Lakehouse Sync** carries operational changes into Unity Catalog Delta
+  tables for analytical and AI processing.
+- **Spark and Databricks AI Functions** perform API-heavy graph discovery away
+  from the application request path.
+- **Lakebase synced tables** return the processed graph to the application as a
+  read-optimized Postgres model.
+- **Human feedback** invalidates stale AI cache entries and changes subsequent
+  model prompts.
 
-**Day 2** is where the heavy lifting happens: multi-hop graph traversal
-starting from your watchlist repos (`notebooks/day2_processing/`). The graph
-crawler discovers related repositories via AI-powered dependency analysis,
-landing staging and edge tables that get synced back to
-Lakebase.
+## Architecture
 
-The point of the demo: **you should never run heavy graph traversal or
-discovery logic inside your operational Postgres database.** Do it in Spark
-on Delta, then sync the *result* back into Lakebase as fast, read-only
-tables your app can query with simple SQL - no Spark cluster needed at
-request time.
+```mermaid
+flowchart LR
+    user[Reviewer] --> ui[RepoSignal UI]
+    ui --> api[Flask API<br/>Databricks App]
 
-## Files
+    api -->|Add or update repo| github[GitHub API]
+    github -->|Repository metadata| api
+    api -->|Watchlist and feedback writes| operational[(Lakebase<br/>student_* schemas)]
 
-- `app.py` - Flask app: `/healthz`, `/login` (GET/POST, username sign-in + per-student Lakebase schema), `/logout`, `/insights` (GET, read-only synced table), `/watchlist` (GET/POST)
-- `lakebase.py` - Lakebase connection helper (single `LAKEBASE_URL`, psycopg2 + SQLAlchemy)
-- `github_client.py` - GitHub REST API client (paginated search + single-repo lookup)
-- `setup_secrets.py` - One-time script to store the Lakebase URL and an optional GitHub PAT
-- `notebooks/day1_ingest/ingest_github_repos.py` - Day 1. Pulls repos from GitHub's Search API into a Bronze Delta table
-- `notebooks/day1_ingest/ingest_github_files.py` - Day 1. Walks every repo's full file tree (Git Trees API, limited concurrency) into a Bronze Delta table
-- `app.yaml` - Databricks App deployment config (command + env vars)
-- `.env.example` - Local dev env var template (copy to `.env`, do not commit real values)
-- `templates/index.html` - UI: add repos to your watchlist, browse Spark-processed insights
+    operational -->|Lakehouse Sync / CDC| history[(Unity Catalog Delta<br/>watchlist + feedback history)]
+    history --> traversal[Spark graph traversal]
+    github -->|Trees, manifests, commits| traversal
 
-## Step-by-step setup
+    traversal -->|Cache miss| ai[Databricks ai_query]
+    ai -->|Package to repository mappings| traversal
+    traversal <--> cache[(Delta<br/>ai_query_cache)]
+    traversal --> graph[(Delta<br/>github_api_staging + github_graph_edges)]
 
-### 1. Create a Lakebase instance and a native-password role
+    graph -->|Lakebase synced table| readmodel[(Lakebase read model<br/>uc_github_graph_edges)]
+    readmodel -->|Graph and statistics| api
+    api --> ui
 
-1. In your Databricks workspace, go to **Catalog** (left sidebar) and select the **Lakebase** tab (or search "Lakebase" in the workspace search bar).
-2. Click **Create Lakebase instance**, give it a name (e.g. `github-insights-db`), choose defaults, and wait for **Available**.
-3. Open the instance, go to **Roles & Databases**, enable **Native (password) authentication** if not already on.
-4. **Create a new role** with **Password** auth (e.g. `github_app`), and copy the connection URL:
-
-   ```
-   postgresql://<role>:<password>@<host>.database.cloud.databricks.com:5432/databricks_postgres?sslmode=require
-   ```
-
-### 2. (Optional) Create a GitHub personal access token
-
-Unauthenticated GitHub API requests work fine for this lab (60 req/hr is
-plenty for a few hundred repos). If you want higher throughput:
-
-1. Go to GitHub → **Settings** → **Developer settings** → **Personal access tokens** → **Fine-grained tokens**.
-2. Generate a token with **read-only** access to public repositories.
-3. Keep it handy for the next step - you can also just skip this entirely.
-
-### 3. Store your secrets
-
-Run once from a Databricks notebook or terminal attached to a cluster:
-
-```python
-%sh python setup_secrets.py
+    ui -. Mark suggestion bad .-> operational
+    history -. Latest bad feedback .-> traversal
 ```
 
-This prompts (via `getpass`) for your **Lakebase connection URL** and an
-**optional GitHub token**. Press Enter at the GitHub prompt to skip it.
+The architecture deliberately separates transactional serving from expensive
+processing. The web app never runs Spark or an LLM in an HTTP request. It reads
+and writes Postgres; the Lakehouse handles CDC, graph traversal, AI inference,
+caching, validation, and durable analytical output.
 
-### 4. Day 1 - Ingest/replicate raw GitHub data into Bronze Delta
+## Forward data flow
 
-Open `notebooks/day1_ingest/ingest_github_repos.py` in Databricks, attach it
-to a cluster, and run it. Adjust the widgets at the top:
-- `catalog` / `schema` - where to land the Bronze table (defaults to `main.ltap_lab_day1`)
-- `query` - a GitHub search query, e.g. `language:python stars:>1000`
-- `max_results` - how many repos to pull (up to 1000 per GitHub Search API limits)
+1. A user signs in with a classroom username. The app maps it to the isolated
+   Lakebase schema `student_<username>`.
+2. The user adds `owner/repository` to the watchlist. The Flask API makes one
+   GitHub repository call and upserts the latest metadata into
+   `student_<username>.github_repos`.
+3. Lakehouse Sync replicates the Postgres change stream into the Unity Catalog
+   history table `<catalog>.<schema>.lb_github_repos_history`.
+4. The graph traversal notebook selects the latest non-deleted watchlist state
+   and uses those repositories as breadth-first-search seeds.
+5. Spark workers fetch repository trees, dependency-file contents, and commit
+   data through the GitHub GraphQL or REST APIs. Results are materialized in
+   `<catalog>.<schema>.github_api_staging`.
+6. For each source repository, the traversal checks
+   `<catalog>.<schema>.ai_query_cache`:
 
-This writes `github_repos_bronze` with one row per repo and its raw JSON payload.
+   - A cache hit reuses persisted package-to-repository mappings.
+   - A cache miss sends selected manifest contents to
+     `ai_query('databricks-meta-llama-3-3-70b-instruct', ...)`.
 
-### 5. Day 1 - Capture every file in each repo
+7. Candidate repositories are deduplicated and validated against GitHub before
+   becoming traversal seeds for the next hop.
+8. Relationships are merged into
+   `<catalog>.<schema>.github_graph_edges`, keyed by source and target.
+9. A Lakebase synced table publishes that Delta result as
+   `<username>.uc_github_graph_edges`.
+10. The Flask API reads the synced table to serve graph rows and aggregate
+    statistics to the RepoSignal UI.
 
-Open `notebooks/day1_ingest/ingest_github_files.py` and run it against the same
-catalog/schema, after step 4 has populated `github_repos_bronze`. For each
-repo it makes ONE GitHub API call (`GET /repos/{full_name}/git/trees/{sha}?recursive=1`)
-to fetch the entire file tree, then flattens every file (`path`, `size`,
-`sha`, `mode`) into a row. Adjust the widgets:
-- `max_workers` - how many repos to fetch concurrently (default 5) - keeps
-  the notebook within GitHub's rate limit (60 req/hr unauthenticated, 5,000
-  req/hr with a PAT) while still parallelizing across hundreds of repos
-- `max_repos` - cap how many repos to process (0 = all rows in the bronze
-  repos table)
-- `mode` - `overwrite` (default) or `append` the files Bronze table
+## Human-feedback flow
 
-Output lands in `github_repo_files_bronze`, one row per file, keyed by
-`repo_full_name`.
+The feedback path turns the pipeline from one-way inference into a closed loop:
 
-### 6. Day 2 - Run the graph traversal
+1. The UI exposes **Mark bad** on `ai_suggested` graph edges.
+2. `POST /graph/edges/feedback` validates the source repository, package,
+   suggested repository, feedback value, and optional reason.
+3. The API upserts the current review into
+   `student_<username>.ai_suggestion_feedback`. The unique mapping key is
+   `(source_repo, package_name, suggested_repo)`, so repeated reviews update the
+   existing state.
+4. `REPLICA IDENTITY FULL` allows Lakehouse Sync to preserve complete update and
+   delete row images in
+   `<catalog>.<schema>.lb_ai_suggestion_feedback_history`.
+5. At the start of AI discovery, `load_blocked_ai_suggestions()` reconstructs
+   the latest non-deleted state for every mapping and selects the latest `bad`
+   reviews.
+6. If a rejected source/target pair exists in `ai_query_cache`, a Delta
+   `MERGE ... WHEN MATCHED DELETE` removes **all cache rows for that source
+   repository**. Source-level invalidation forces a coherent replacement
+   analysis rather than retaining a partially stale mapping set.
+7. Invalidated sources are processed first. Their cache is bypassed and the
+   prompt includes explicit `Do NOT suggest` rules for rejected repositories.
+8. The notebook filters blocked or malformed model output, stores allowed
+   replacements in the Delta cache, validates them on GitHub, and merges the
+   new relationships into the graph.
+9. The synced graph read model refreshes and the application can display the
+   replacement results alongside the Lakebase feedback history.
 
-Open `notebooks/day2_processing/github graph traversal.py` and run it. Configure
-the widgets:
-- `catalog` / `schema` — your Unity Catalog location
-- `target_repos` — how many repos to discover (default: 500)
-- `max_hops` — depth of traversal (default: 3)
-- `fetch_mode` — `graphql` (recommended, ~2 API calls/repo) or `rest` (~6 calls/repo)
+If physical cache deletion fails, the traversal still applies the in-memory
+blocked set and prompt exclusions for that run. This prevents a known bad
+repository from being accepted merely because cleanup failed.
 
-This starts from your watchlist repos (seed repos) and discovers related
-repositories via AI-powered dependency analysis.
-Output lands in `github_api_staging` and `github_graph_edges`.
+## Main implementation
 
-### 7. Sync graph data back to Lakebase (Synced Tables)
+### Databricks App and UI
 
-1. In your Databricks workspace, open the **Lakebase** tab for your instance.
-2. Go to **Synced Tables** and click **Create synced table**.
-3. Create synced tables for both:
-   - `github_api_staging` — all raw repo data (files, contents, commits)
-   - `github_graph_edges` — the relationship graph
-4. Choose a sync mode (snapshot or continuous - snapshot is fine for this demo).
-5. Confirm - Databricks creates **read-only** Postgres tables inside your Lakebase instance, kept in sync from the Delta tables.
+`app.py` is a Flask application deployed as `week1-homework`. It provides:
 
-> **Note:** Synced Tables are read-only in Postgres by design - the app
-> never writes to these tables, only reads from them. Re-run the notebook
-> and the synced tables update automatically (per the sync schedule you chose).
+- classroom-style username sessions and strict schema-name validation;
+- watchlist add, remove, favorite, and list operations;
+- graph reads and relationship statistics from a synced Lakebase table;
+- feedback upsert and feedback-history endpoints; and
+- JSON error handling so the browser always receives a consistent response.
 
-### 8. Configure environment variables (local dev)
+`templates/index.html`, `static/app.js`, and `static/styles.css` implement the
+RepoSignal experience: overview metrics, watchlist actions, graph filters,
+repository-focused navigation, a feedback modal, feedback history, and explicit
+loading, empty, success, and error states.
+
+### Lakebase operational layer
+
+The app writes only per-user operational state:
+
+| Object | Access | Purpose |
+|---|---|---|
+| `student_<username>.github_repos` | Read/write | Watchlist and latest GitHub repository metadata |
+| `student_<username>.github_files` | Read/write extension | File inventory used by the broader lab |
+| `student_<username>.ai_suggestion_feedback` | Read/write | Current human-review state for AI mappings |
+| `<username>.uc_github_graph_edges` | Read-only | Synced graph result served to the UI |
+
+`lakebase.py` retrieves the Lakebase connection URL from the Databricks secret
+`database/lakebase-url` through `WorkspaceClient`, then uses psycopg2 for
+parameterized reads and writes.
+
+### Lakehouse and AI processing
+
+| Unity Catalog Delta table | Producer | Purpose |
+|---|---|---|
+| `lb_github_repos_history` | Lakehouse Sync | CDC history used to reconstruct current watchlist seeds |
+| `lb_ai_suggestion_feedback_history` | Lakehouse Sync | CDC history used to reconstruct current rejected mappings |
+| `github_repos_scd` | `generate_repo_scd.py` | Optional incremental SCD representation of watchlist state |
+| `github_api_staging` | Graph traversal | Files, dependency contents, and commits fetched from GitHub |
+| `ai_query_cache` | Graph traversal | Persisted AI package-to-repository mappings |
+| `github_graph_edges` | Graph traversal | Durable source/target relationship graph |
+
+The graph notebook supports configurable catalog, schema, target repository
+count, maximum hops, and fetch mode. GraphQL mode uses approximately two GitHub
+calls per repository; REST mode uses approximately five to seven. A run-level
+request budget stops traversal before exhausting the authenticated GitHub API
+allowance.
+
+The standalone `dependency_parsers.py` module contains deterministic parsers for
+common package manifests and is covered by unit tests. The current graph
+notebook sends selected manifest contents directly to `ai_query`; the parser
+module is available for a future deterministic pre-processing stage.
+
+## Repository structure
+
+```text
+.
+├── app.py                         # Flask routes and application logic
+├── lakebase.py                    # Lakebase secret resolution and SQL helpers
+├── github_client.py               # GitHub REST/GraphQL client helpers
+├── dependency_parsers.py          # Deterministic manifest parsers
+├── templates/                     # Login and RepoSignal HTML
+├── static/                        # Browser behavior and styling
+├── sql/                           # Per-user Lakebase table DDL
+├── notebooks/
+│   ├── day1_ingest/
+│   │   └── generate_repo_scd.py   # Incremental CDC-to-SCD processing
+│   └── day2_processing/
+│       └── github graph traversal.py
+├── app.yaml                       # Databricks App runtime configuration
+├── databricks.yml                 # App and Lakeflow Job bundle metadata
+├── deployment/                    # App-only metadata and Git deploy requests
+├── DEPLOYMENT_VERIFICATION.md     # Deployment provenance checklist
+└── test_*.py                      # Feedback API and parser tests
+```
+
+## Run the architecture end to end
+
+### Prerequisites
+
+- A Databricks workspace with Unity Catalog and compute capable of running the
+  Spark notebook and `ai_query`.
+- A Lakebase Postgres database reachable by the Databricks App.
+- A Databricks secret named `database/lakebase-url` containing the Postgres
+  connection URL used by the current implementation.
+- An optional GitHub token in `github/token` for the notebook. Without it,
+  GitHub applies the unauthenticated rate limit.
+- A selected Databricks CLI profile. Always pass it explicitly as
+  `--profile <PROFILE>`.
+
+### 1. Create the per-user Lakebase schema
+
+Replace `<username>` in the SQL files before execution. The feedback DDL is
+currently checked in for `student_sri`; change that schema when using another
+username.
+
+```text
+sql/create_student_schema.sql
+sql/create_github_repos.sql
+sql/create_github_files.sql
+sql/create_ai_suggestion_feedback.sql
+```
+
+The commits and file-contents DDL files are optional extensions. Keep
+`REPLICA IDENTITY FULL` on tables whose updates or deletes must be consumed from
+CDC history.
+
+### 2. Configure both synchronization directions
+
+In the Databricks UI, configure Lakehouse Sync from Lakebase to Unity Catalog
+for at least:
+
+| Lakebase source | Expected Unity Catalog target |
+|---|---|
+| `student_<username>.github_repos` | `<catalog>.<schema>.lb_github_repos_history` |
+| `student_<username>.ai_suggestion_feedback` | `<catalog>.<schema>.lb_ai_suggestion_feedback_history` |
+
+Then configure a Lakebase synced table from
+`<catalog>.<schema>.github_graph_edges` to
+`<username>.uc_github_graph_edges`. The destination name and schema must match
+`app.py` unless the application mapping is changed.
+
+### 3. Add seed repositories
+
+Start the app, sign in with the configured username, and add one or more
+`owner/repository` values. Confirm the rows reach `lb_github_repos_history`
+before running graph discovery.
+
+For local execution, install dependencies and use an authenticated Databricks
+SDK profile that can read the configured secrets:
 
 ```bash
-cp .env.example .env
+python -m pip install -r requirements.txt
+DATABRICKS_CONFIG_PROFILE=<PROFILE> python app.py
 ```
 
-Paste your Lakebase URL as `LAKEBASE_URL`. For deployment, `app.yaml`
-already pulls it from the `database/lakebase-url` secret automatically.
+### 4. Run graph discovery
 
-### 9. Install dependencies and run locally
+Run `notebooks/day2_processing/github graph traversal.py` and set:
+
+| Widget | Meaning | Default |
+|---|---|---|
+| `catalog` | Unity Catalog containing CDC and graph tables | `bootcamp_students` |
+| `schema` | User-specific Unity Catalog schema | `sri` |
+| `target_repos` | Maximum repositories to discover | `500` |
+| `max_hops` | Maximum breadth-first traversal depth | `3` |
+| `fetch_mode` | `graphql` or `rest` | `graphql` |
+
+Verify that `github_api_staging`, `ai_query_cache`, and `github_graph_edges`
+are created or updated.
+
+### 5. Close the feedback loop
+
+1. Refresh the graph synced table and open RepoSignal.
+2. Mark an `ai_suggested` edge as bad and optionally provide a reason.
+3. Confirm the review appears in the UI feedback history.
+4. Confirm CDC delivers the row to `lb_ai_suggestion_feedback_history`.
+5. Run the graph traversal again.
+6. Check notebook output for cache invalidation and feedback-aware re-querying.
+7. Refresh the synced graph and inspect the replacement suggestion.
+
+## API surface
+
+| Method | Route | Purpose |
+|---|---|---|
+| `GET` | `/healthz` | App health check |
+| `GET`, `POST` | `/login` | Classroom username session |
+| `POST` | `/logout` | Clear the current session |
+| `GET` | `/schema/status` | Check required per-user tables |
+| `GET`, `POST`, `DELETE` | `/repos` | List, add/update, or remove watched repositories |
+| `POST` | `/repos/favorite` | Update favorite state |
+| `GET` | `/graph/edges` | Query graph edges with optional filters |
+| `GET` | `/graph/stats` | Count graph edges by relationship type |
+| `GET`, `POST` | `/graph/edges/feedback` | Read or upsert AI-suggestion feedback |
+
+## Tests
 
 ```bash
-pip install -r requirements.txt
-python app.py
+python -m pytest -q
 ```
 
-### 10. Deploy as a Databricks App
+The test suite covers deterministic dependency parsing, feedback validation,
+feedback upserts, missing-table behavior, and feedback-history rendering.
 
-Same as any Databricks App - create a **Git folder** pointing at this repo,
-create a **Custom App** in **Compute > Apps**, point it at the Git folder,
-and click **Deploy**. See the Databricks Apps docs for the full UI walkthrough.
+## Deployment
 
-## Endpoints
+The Databricks App is configured to build from the independent repository:
 
-- `GET /healthz` - health check
-- `GET /login` - sign-in page (enter a username, no password)
-- `POST /login` with `{"username": "ada"}` (or a form field) - validates the username as a safe
-  Postgres schema fragment, then creates (idempotently) a dedicated `student_<username>` schema
-  in Lakebase with empty `github_repos` and `github_files` tables, and starts a session
-- `POST /logout` - clear the current session
-- `GET /insights?language=Python&limit=25` - read Spark-processed, Synced-Table-backed insights (read-only)
-- `GET /watchlist` - get the current user's watched repos with last known stats
-- `POST /watchlist` with `{"full_name": "owner/repo"}` - add/update a repo on the current user's watchlist (one GitHub API call)
+```text
+https://github.com/srinivas-malyala/closed-loop-ai-feedback
+```
 
-## Student sign-in and per-student Lakebase schemas
-
-Signing in at `/login` does NOT check a password - it is a lightweight "pick your name" flow for a
-classroom setting, similar to how FastAPI tutorials often show a simple form-based session login.
-Enter a username, which must be lowercase letters/digits/underscores and start with a letter or
-underscore (validated server-side against a strict regex so it can never be used to inject SQL -
-Postgres identifiers like schema/table names cannot be parameterized as query values, so the
-username is validated *before* being interpolated into DDL, and `psycopg2.sql.Identifier` quotes
-it besides).
-
-On successful sign-in, the app validates the username and starts a session. Students create
-their own schema and tables as a separate exercise by running the SQL files in `sql/`:
+Use the app-specific requests so deployment does not create or update the
+separate Lakeflow Job also declared in `databricks.yml`:
 
 ```bash
-sql/create_student_schema.sql   # CREATE SCHEMA IF NOT EXISTS student_<username>
-sql/create_github_repos.sql     # CREATE TABLE + ALTER TABLE ... REPLICA IDENTITY FULL
-sql/create_github_files.sql     # CREATE TABLE + ALTER TABLE ... REPLICA IDENTITY FULL
+databricks bundle validate --strict -t prod --profile <PROFILE>
+
+databricks apps create-update week1-homework \
+  --profile <PROFILE> \
+  --json @deployment/app-metadata-update.json
+
+databricks apps deploy week1-homework \
+  --profile <PROFILE> \
+  --json @deployment/git-deployment.json
+
+databricks apps get week1-homework --profile <PROFILE> -o json
 ```
 
-Because students connect as their own OAuth identity when running these, they own the tables
-and can set REPLICA IDENTITY (owner-only DDL) without permission issues. The app UI shows a
-warning banner if the schema/tables haven't been created yet.
+After deployment, verify that the app is running and that
+`active_deployment.git_source.resolved_commit` matches `origin/main`. See
+`DEPLOYMENT_VERIFICATION.md` for the complete Git URL, commit SHA, resource,
+health, and functional checklist.
 
-## Demo narrative (suggested flow)
+## Design choices and current boundaries
 
-1. **Day 1 - Ingest/replicate**: Run `notebooks/day1_ingest/ingest_github_repos.py` (and optionally `ingest_github_files.py`) live, show the raw Bronze table(s).
-2. **Day 2 - Graph traversal**: Run `notebooks/day2_processing/github graph traversal.py`, show the multi-hop discovery crawling from seed repos, building the relationship graph.
-3. **Sync back**: Create Synced Tables in the Lakebase UI for `github_api_staging` and `github_graph_edges`, show them appear in Postgres.
-4. **Surface**: Load the app, show graph-discovered repos and relationships, add repos to the personal watchlist live.
-5. **Payoff**: "Heavy graph traversal and AI-powered discovery happened entirely in the lake - the app never touched Spark, it just reads synced Postgres tables."
+- **Operational and analytical responsibilities are separate.** Lakebase
+  serves application interactions; Spark and Delta own graph/AI processing.
+- **AI results are materialized.** Cache hits avoid repeated LLM inference,
+  reducing latency and token cost.
+- **Invalidation is intentionally source-wide.** One rejected mapping causes a
+  complete re-analysis for that source repository.
+- **Model output is not trusted directly.** Suggestions must have repository
+  shape, must not be blocked, and must resolve through the GitHub API.
+- **Synced graph tables are read-only.** The app does not mutate Spark-owned
+  outputs in Postgres.
+- **The login is for a lab/demo.** It is not production authentication or
+  authorization.
+- **Rejected historical edges are not deleted by the current graph merge.**
+  Feedback prevents reuse and drives replacement inference, while the existing
+  source/target edge remains until a separate cleanup policy is implemented.
+- **The current Lakebase connection uses a stored native-password URL.** A
+  production implementation should prefer managed Lakebase app resources and
+  OAuth-based connectivity.
 
-## Graph Traversal & Repo Discovery
+## Core idea
 
-The notebook `notebooks/day2_processing/github graph traversal.py` implements a
-multi-hop graph crawl that discovers related repositories starting from your
-watchlist (seed repos). It builds a relationship graph using two discovery methods:
+This repository is not primarily a two-day lab. It is an implementation of a
+repeatable closed-loop pattern:
 
-### Discovery Methods
-
-| Method | Edge Type | How it works |
-|--------|-----------|--------------|
-| **AI dependency analysis** | `dependency`, `ai_suggested` | Reads dependency files (package.json, requirements.txt, etc.), sends them to `ai_query` (Llama 3.1 70B) which suggests specific `owner/repo` names, then validates they exist on GitHub. |
-
-### Output Tables
-
-| Table | Description |
-|-------|-------------|
-| `github_api_staging` | Raw data (files, dependency contents, commits) for all discovered repos |
-| `github_graph_edges` | Relationship graph: who/what led to each repo's discovery |
-
-### Graph Edges Schema
-
-```
-source          STRING    -- source repo (owner/repo)
-target          STRING    -- discovered repo (owner/repo)
-edge_type       STRING    -- "dependency", "ai_suggested"
-metadata        STRING    -- JSON with context (e.g. {"source_repo": "org/repo"})
-discovered_at   STRING    -- ISO timestamp of when the edge was recorded
-```
-
-### Syncing Graph Data to Lakebase
-
-To make the graph traversal results queryable from the Flask app (or any Postgres client):
-
-1. **Run the graph traversal notebook** — configure widgets:
-   - `catalog` / `schema` — your Unity Catalog location
-   - `target_repos` — how many repos to discover (default: 500)
-   - `max_hops` — depth of traversal (default: 3)
-   - `fetch_mode` — `graphql` (recommended, ~2 API calls/repo) or `rest` (~6 calls/repo)
-
-2. **Create Synced Tables** in the Lakebase UI for:
-   - `github_api_staging` — all raw repo data (files, contents, commits)
-   - `github_graph_edges` — the relationship graph
-
-3. **Query the graph** in Postgres:
-   ```sql
-   -- Find all repos connected to a specific repo
-   SELECT target, edge_type, metadata
-   FROM github_graph_edges
-   WHERE source = 'facebook/react';
-
-   -- Find AI-suggested repos from dependency analysis
-   SELECT source, target
-   FROM github_graph_edges
-   WHERE edge_type = 'ai_suggested';
-   ```
-
-### Rate Limit Awareness
-
-The traversal tracks GitHub API usage and stops early if approaching the
-5,000 requests/hour limit. Budget allocation:
-- **Per-repo fetch**: ~2 calls (GraphQL mode) or ~6 calls (REST mode)
-- **AI validation**: 1 call per suggested repo (capped at 50/hop)
-- **Hard cap**: 4,000 requests per run (leaves headroom)
-
-## Notes
-
-- Lakebase auth uses a single `LAKEBASE_URL` secret pointing at a native Postgres role with a
-  static, non-expiring password - no token refresh logic needed in `lakebase.py`.
-- GitHub auth is optional; `github_client.py` and the ingestion notebook both fall back to
-  unauthenticated requests if no token secret is configured.
-- The `watchlist` table is the only table this app writes to directly - `github_api_staging` and
-  `github_graph_edges` are owned by the Synced Table pipeline and must not be written to from the app.
+> Capture operational intent in Lakebase, process it at scale in the Lakehouse,
+> serve the result back through a low-latency read model, and use human feedback
+> to invalidate stale AI state and improve the next computation.

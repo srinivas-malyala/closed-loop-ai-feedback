@@ -1,0 +1,10 @@
+{
+  "update_mask": "description,git_repository",
+  "app": {
+    "description": "Closed-loop AI feedback app sourced from https://github.com/srinivas-malyala/closed-loop-ai-feedback.",
+    "git_repository": {
+      "provider": "gitHub",
+      "url": "https://github.com/srinivas-malyala/closed-loop-ai-feedback"
+    }
+  }
+}
