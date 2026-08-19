@@ -1,394 +1,257 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>GitHub Repo Explorer</title>
-  <style>
-    body { font-family: -apple-system, Arial, sans-serif; max-width: 960px; margin: 60px auto; color: #222; }
-    h1 { font-size: 20px; }
-    label { display: block; margin-top: 16px; font-weight: 600; }
-    input[type="text"] { width: 100%; padding: 8px; margin-top: 6px; box-sizing: border-box; }
-    button { margin-top: 16px; padding: 8px 16px; cursor: pointer; }
-    #result { margin-top: 20px; white-space: pre-wrap; background: #f6f6f6; padding: 12px; border-radius: 6px; min-height: 20px; }
-    .hint { color: #777; font-size: 13px; margin-top: 4px; }
-    table { width: 100%; margin-top: 24px; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px; border-bottom: 1px solid #ddd; }
-    th { font-size: 13px; color: #555; text-transform: uppercase; }
-    .fav-btn { cursor: pointer; background: none; border: none; font-size: 18px; padding: 0 4px; }
-    .del-btn { cursor: pointer; background: none; border: none; font-size: 14px; color: #b00020; padding: 0 4px; }
-    .feedback-btn { margin: 0; padding: 5px 9px; border: 1px solid #b00020; border-radius: 4px; background: #fff; color: #b00020; white-space: nowrap; }
-    .feedback-btn:hover { background: #fff1f2; }
-    #feedback-status { display: none; margin: 12px 0; padding: 10px 12px; border-radius: 6px; font-size: 13px; }
-    #feedback-status.success { display: block; color: #155724; background: #d4edda; border: 1px solid #c3e6cb; }
-    #feedback-status.error { display: block; color: #721c24; background: #f8d7da; border: 1px solid #f5c6cb; }
-    dialog { width: min(440px, calc(100% - 40px)); border: 1px solid #ccc; border-radius: 8px; padding: 22px; box-shadow: 0 12px 36px rgba(0, 0, 0, 0.2); }
-    dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
-    dialog h3 { margin-top: 0; }
-    dialog textarea { width: 100%; min-height: 80px; padding: 8px; margin-top: 6px; box-sizing: border-box; resize: vertical; }
-    .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
-    .dialog-actions button { margin-top: 0; }
-  </style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>RepoSignal · GitHub intelligence</title>
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+    integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB"
+    crossorigin="anonymous"
+  >
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.13.1/font/bootstrap-icons.min.css"
+  >
+  <link rel="stylesheet" href="/static/styles.css">
 </head>
-<body>
-  <h1>GitHub Repo Explorer</h1>
-  <p class="hint">
-    Signed in as <strong>{{ username }}</strong> (Lakebase schema <code>{{ schema }}</code>) -
-    <form method="POST" action="/logout" style="display:inline;"><button type="submit" style="margin-top:0;">Sign out</button></form>
-  </p>
-
-  <div id="schema-warning" style="display:none; background:#fff3cd; border:1px solid #ffc107; border-radius:6px; padding:12px; margin-bottom:20px;">
-    <strong>⚠️ Schema setup incomplete.</strong>
-    <span id="schema-warning-detail"></span>
-    <p style="margin:8px 0 0; font-size:13px;">Run the SQL files in the <code>sql/</code> folder to create your schema and tables, including <code>sql/create_ai_suggestion_feedback.sql</code> for graph feedback.</p>
-  </div>
-
-  <p class="hint">Enter an "owner/repo" name. This fetches stats from GitHub and adds it to your <code>github_repos</code> table.</p>
-
-  <form id="repo-form">
-    <label for="full_name">Repository (owner/repo)</label>
-    <input type="text" id="full_name" name="full_name" placeholder="databricks/spark" required>
-    <button type="submit">Add repo</button>
-  </form>
-
-  <div id="result"></div>
-
-  <table id="repos-table">
-    <thead>
-      <tr>
-        <th>Repo</th>
-        <th>Language</th>
-        <th>Stars</th>
-        <th>Open Issues</th>
-        <th>Forks</th>
-        <th>Fav</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="repos-body"></tbody>
-  </table>
-
-  <hr style="margin-top:40px;">
-  <h2 style="font-size:18px;">Repo Graph</h2>
-  <p class="hint">Relationships discovered via graph traversal (AI dependency analysis). Synced from Unity Catalog.</p>
-  <div id="repo-filter-indicator" style="display:none; margin-bottom:8px; font-size:13px; background:#e3f2fd; border-radius:4px; padding:6px 10px;">
-    Filtering graph by: <strong id="repo-filter-name"></strong>
-    <button onclick="clearRepoFilter()" style="margin-left:8px; cursor:pointer; background:none; border:none; color:#1565c0; font-size:13px;">✕ Clear</button>
-  </div>
-
-  <div style="margin-bottom:12px;">
-    <label for="edge-filter" style="display:inline; font-size:13px;">Filter by type:</label>
-    <select id="edge-filter" onchange="loadEdges()" style="padding:4px 8px;">
-      <option value="">All</option>
-      <option value="dependency">Dependency</option>
-      <option value="ai_suggested">AI Suggested</option>
-    </select>
-    <span id="edge-stats" style="margin-left:16px; font-size:13px; color:#555;"></span>
-  </div>
-
-  <div id="feedback-status" role="status" aria-live="polite"></div>
-
-  <table id="edges-table">
-    <thead>
-      <tr>
-        <th>Source</th>
-        <th>→</th>
-        <th>Target</th>
-        <th>Type</th>
-        <th>Details</th>
-        <th>Discovered</th>
-        <th>Feedback</th>
-      </tr>
-    </thead>
-    <tbody id="edges-body"></tbody>
-  </table>
-  <p id="edges-empty" class="hint" style="display:none;">No graph edges found. Run the graph traversal notebook and sync the table to Lakebase.</p>
-
-  <dialog id="feedback-dialog" aria-labelledby="feedback-dialog-title">
-    <form id="feedback-form">
-      <h3 id="feedback-dialog-title">Mark AI suggestion as bad</h3>
-      <p class="hint">
-        <code id="feedback-source"></code> suggested
-        <code id="feedback-target"></code>.
-      </p>
-      <label for="feedback-package">Dependency/package</label>
-      <input type="text" id="feedback-package" name="package_name" required>
-      <p class="hint">Enter the package that led the AI to this repository. It is required so the pipeline can block the exact cached mapping.</p>
-      <label for="feedback-reason">Reason (optional)</label>
-      <textarea id="feedback-reason" name="reason" placeholder="For example: Repo is archived or unrelated"></textarea>
-      <div class="dialog-actions">
-        <button type="button" id="feedback-cancel">Cancel</button>
-        <button type="submit" id="feedback-submit">Submit feedback</button>
+<body class="app-body">
+  <nav class="navbar app-navbar sticky-top" aria-label="Primary navigation">
+    <div class="container-xxl px-3 px-lg-4">
+      <a class="navbar-brand d-flex align-items-center gap-2" href="/">
+        <span class="brand-mark" aria-hidden="true"><i class="bi bi-bezier2"></i></span>
+        <span>RepoSignal</span>
+      </a>
+      <div class="d-flex align-items-center gap-2 gap-md-3">
+        <div class="user-chip d-none d-sm-flex">
+          <span class="avatar">{{ username[0] | upper }}</span>
+          <span>
+            <strong>{{ username }}</strong>
+            <small>{{ schema }}</small>
+          </span>
+        </div>
+        <form method="POST" action="/logout">
+          <button type="submit" class="btn btn-outline-secondary btn-sm rounded-pill px-3">
+            <i class="bi bi-box-arrow-right me-1" aria-hidden="true"></i>
+            <span class="d-none d-sm-inline">Sign out</span>
+          </button>
+        </form>
       </div>
-    </form>
-  </dialog>
+    </div>
+  </nav>
 
-  <script>
-    const form = document.getElementById("repo-form");
-    const resultEl = document.getElementById("result");
-    const reposBody = document.getElementById("repos-body");
-    const schemaWarning = document.getElementById("schema-warning");
-    const schemaWarningDetail = document.getElementById("schema-warning-detail");
-    const feedbackDialog = document.getElementById("feedback-dialog");
-    const feedbackForm = document.getElementById("feedback-form");
-    const feedbackStatus = document.getElementById("feedback-status");
-    const feedbackSubmit = document.getElementById("feedback-submit");
-    let activeRepoFilter = null;
-    let feedbackEdge = null;
+  <main class="container-xxl px-3 px-lg-4 py-4 py-lg-5">
+    <section class="hero-panel mb-4" aria-labelledby="page-title">
+      <div class="hero-content">
+        <span class="eyebrow"><i class="bi bi-stars me-1"></i> AI-powered repository intelligence</span>
+        <h1 id="page-title">Explore repositories.<br>Improve every suggestion.</h1>
+        <p>Track the projects you care about, inspect dependency relationships, and turn human feedback into better AI results.</p>
+      </div>
+      <div class="hero-orbit d-none d-lg-block" aria-hidden="true">
+        <span class="orbit-node node-one"><i class="bi bi-github"></i></span>
+        <span class="orbit-node node-two"><i class="bi bi-database"></i></span>
+        <span class="orbit-node node-three"><i class="bi bi-cpu"></i></span>
+      </div>
+    </section>
 
-    async function checkSchemaStatus() {
-      try {
-        const resp = await fetch("/schema/status");
-        const data = await resp.json();
-        if (!resp.ok) return;
+    <section class="row g-3 mb-4" aria-label="Repository overview">
+      <div class="col-6 col-xl-3">
+        <article class="stat-card h-100">
+          <span class="stat-icon icon-blue"><i class="bi bi-journal-bookmark"></i></span>
+          <span class="stat-copy"><strong id="repo-count">—</strong><small>Watched repos</small></span>
+        </article>
+      </div>
+      <div class="col-6 col-xl-3">
+        <article class="stat-card h-100">
+          <span class="stat-icon icon-amber"><i class="bi bi-star-fill"></i></span>
+          <span class="stat-copy"><strong id="favorite-count">—</strong><small>Favorites</small></span>
+        </article>
+      </div>
+      <div class="col-6 col-xl-3">
+        <article class="stat-card h-100">
+          <span class="stat-icon icon-violet"><i class="bi bi-diagram-3"></i></span>
+          <span class="stat-copy"><strong id="edge-count">—</strong><small>Graph edges</small></span>
+        </article>
+      </div>
+      <div class="col-6 col-xl-3">
+        <article class="stat-card h-100">
+          <span class="stat-icon icon-rose"><i class="bi bi-magic"></i></span>
+          <span class="stat-copy"><strong id="ai-edge-count">—</strong><small>AI suggestions</small></span>
+        </article>
+      </div>
+    </section>
 
-        const missing = [];
-        if (!data.schema_exists) missing.push("schema " + data.schema);
-        if (!data.github_repos_exists) missing.push("table github_repos");
-        if (!data.github_files_exists) missing.push("table github_files");
-        if (!data.ai_suggestion_feedback_exists) missing.push("table ai_suggestion_feedback");
+    <div id="schema-warning" class="alert schema-alert align-items-start gap-3 mb-4" role="alert">
+      <span class="alert-icon"><i class="bi bi-exclamation-triangle-fill"></i></span>
+      <div>
+        <h2 class="alert-heading h6 mb-1">Schema setup needs attention</h2>
+        <p id="schema-warning-detail" class="mb-1"></p>
+        <small>Run the SQL files in <code>sql/</code>, including <code>create_ai_suggestion_feedback.sql</code> for graph feedback.</small>
+      </div>
+    </div>
 
-        if (missing.length > 0) {
-          schemaWarningDetail.textContent = " Missing: " + missing.join(", ") + ".";
-          schemaWarning.style.display = "block";
-        }
-      } catch (err) {}
-    }
+    <section class="content-card mb-4" aria-labelledby="watchlist-title">
+      <div class="card-heading">
+        <div>
+          <span class="section-kicker">Your workspace</span>
+          <h2 id="watchlist-title">Repository watchlist</h2>
+          <p>Add a GitHub repository to capture its latest activity and statistics.</p>
+        </div>
+        <span class="source-badge"><i class="bi bi-github me-1"></i> GitHub API</span>
+      </div>
 
-    async function loadRepos() {
-      try {
-        const resp = await fetch("/repos");
-        const data = await resp.json();
-        if (!resp.ok) {
-          if (resp.status === 404) return; // table doesn't exist yet
-          resultEl.textContent = "Error loading repos: " + (data.error || resp.statusText);
-          return;
-        }
-        reposBody.innerHTML = "";
-        data.forEach((row) => {
-          const tr = document.createElement("tr");
-          tr.style.cursor = "pointer";
-          if (activeRepoFilter === row.full_name) tr.style.background = "#e3f2fd";
-          const favIcon = row.is_favorite ? "⭐" : "☆";
-          tr.innerHTML = `<td>${row.full_name}</td><td>${row.language || "-"}</td><td>${row.stargazers_count ?? "-"}</td><td>${row.open_issues_count ?? "-"}</td><td>${row.forks_count ?? "-"}</td><td><button class="fav-btn" onclick="event.stopPropagation(); toggleFav('${row.full_name}', ${!row.is_favorite})">${favIcon}</button></td><td><button class="del-btn" onclick="event.stopPropagation(); removeRepo('${row.full_name}')">✕</button></td>`;
-          tr.addEventListener("click", () => setRepoFilter(row.full_name));
-          reposBody.appendChild(tr);
-        });
-      } catch (err) {
-        resultEl.textContent = "Failed to load repos: " + err;
-      }
-    }
+      <form id="repo-form" class="repo-search" novalidate>
+        <div class="input-group input-group-lg">
+          <span class="input-group-text"><i class="bi bi-search" aria-hidden="true"></i></span>
+          <input
+            type="text"
+            class="form-control"
+            id="full_name"
+            name="full_name"
+            placeholder="Try databricks/spark"
+            aria-label="Repository in owner slash repo format"
+            pattern="[^/\s]+/[^/\s]+"
+            required
+          >
+          <button class="btn btn-primary px-4" id="add-repo-button" type="submit">
+            <i class="bi bi-plus-lg me-1"></i>Add repository
+          </button>
+        </div>
+        <div class="form-text mt-2"><i class="bi bi-info-circle me-1"></i>Use the <code>owner/repository</code> format.</div>
+      </form>
 
-    async function toggleFav(fullName, isFavorite) {
-      try {
-        const resp = await fetch("/repos/favorite", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ full_name: fullName, is_favorite: isFavorite }),
-        });
-        if (resp.ok) loadRepos();
-      } catch (err) {
-        resultEl.textContent = "Failed to toggle favorite: " + err;
-      }
-    }
+      <div id="result" class="alert mt-3 mb-0" role="status" aria-live="polite"></div>
 
-    async function removeRepo(fullName) {
-      if (!confirm("Remove " + fullName + "?")) return;
-      try {
-        const resp = await fetch("/repos", {
-          method: "DELETE",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ full_name: fullName }),
-        });
-        if (resp.ok) loadRepos();
-      } catch (err) {
-        resultEl.textContent = "Failed to remove repo: " + err;
-      }
-    }
+      <div class="table-responsive mt-4">
+        <table id="repos-table" class="table app-table align-middle mb-0">
+          <thead>
+            <tr>
+              <th scope="col">Repository</th>
+              <th scope="col">Language</th>
+              <th scope="col" class="text-end">Stars</th>
+              <th scope="col" class="text-end d-none d-lg-table-cell">Issues</th>
+              <th scope="col" class="text-end d-none d-md-table-cell">Forks</th>
+              <th scope="col" class="text-center">Favorite</th>
+              <th scope="col"><span class="visually-hidden">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="repos-body">
+            <tr class="skeleton-row"><td colspan="7"><span></span></td></tr>
+            <tr class="skeleton-row"><td colspan="7"><span></span></td></tr>
+            <tr class="skeleton-row"><td colspan="7"><span></span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="repos-empty" class="empty-state">
+        <span><i class="bi bi-inboxes"></i></span>
+        <h3>No repositories yet</h3>
+        <p>Add your first repository above to start building a watchlist.</p>
+      </div>
+    </section>
 
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const full_name = document.getElementById("full_name").value;
-      resultEl.textContent = "Adding repo...";
+    <section class="content-card" id="graph-section" aria-labelledby="graph-title">
+      <div class="card-heading graph-heading">
+        <div>
+          <span class="section-kicker">Dependency intelligence</span>
+          <h2 id="graph-title">Repository graph</h2>
+          <p>Relationships discovered by Spark and AI, synced from Unity Catalog.</p>
+        </div>
+        <span class="source-badge"><i class="bi bi-database-check me-1"></i> Synced data</span>
+      </div>
 
-      try {
-        const resp = await fetch("/repos", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ full_name }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) {
-          resultEl.textContent = "Error: " + (data.error || resp.statusText);
-          return;
-        }
-        resultEl.textContent = "Added " + data.full_name + " (" + data.stargazers_count + " stars)";
-        document.getElementById("full_name").value = "";
-        loadRepos();
-      } catch (err) {
-        resultEl.textContent = "Request failed: " + err;
-      }
-    });
+      <div class="graph-toolbar">
+        <div class="filter-control">
+          <label for="edge-filter" class="form-label">Relationship type</label>
+          <select id="edge-filter" class="form-select">
+            <option value="">All relationships</option>
+            <option value="dependency">Dependency</option>
+            <option value="ai_suggested">AI suggested</option>
+          </select>
+        </div>
+        <div id="edge-stats" class="edge-stats" aria-live="polite"></div>
+      </div>
 
-    function setRepoFilter(repoName) {
-      activeRepoFilter = repoName;
-      document.getElementById("repo-filter-indicator").style.display = "block";
-      document.getElementById("repo-filter-name").textContent = repoName;
-      loadRepos();
-      loadEdges();
-    }
+      <div id="repo-filter-indicator" class="filter-chip" role="status">
+        <i class="bi bi-funnel-fill" aria-hidden="true"></i>
+        Showing connections for <strong id="repo-filter-name"></strong>
+        <button id="clear-repo-filter" type="button" aria-label="Clear repository filter"><i class="bi bi-x-lg"></i></button>
+      </div>
 
-    function clearRepoFilter() {
-      activeRepoFilter = null;
-      document.getElementById("repo-filter-indicator").style.display = "none";
-      loadRepos();
-      loadEdges();
-    }
+      <div id="feedback-status" class="alert mt-3 mb-0" role="status" aria-live="polite"></div>
 
-    async function loadEdgeStats() {
-      try {
-        const resp = await fetch("/graph/stats");
-        if (!resp.ok) return;
-        const data = await resp.json();
-        const statsEl = document.getElementById("edge-stats");
-        const parts = data.by_type.map(r => `${r.edge_type}: ${r.count}`);
-        statsEl.textContent = `Total: ${data.total_edges} edges (${parts.join(", ")})`;
-      } catch (err) {}
-    }
+      <div class="table-responsive mt-3">
+        <table id="edges-table" class="table app-table graph-table align-middle mb-0">
+          <thead>
+            <tr>
+              <th scope="col">Source</th>
+              <th scope="col" class="connection-column"><span class="visually-hidden">Connects to</span></th>
+              <th scope="col">Target</th>
+              <th scope="col">Type</th>
+              <th scope="col" class="d-none d-lg-table-cell">Details</th>
+              <th scope="col" class="d-none d-xl-table-cell">Discovered</th>
+              <th scope="col">Feedback</th>
+            </tr>
+          </thead>
+          <tbody id="edges-body">
+            <tr class="skeleton-row"><td colspan="7"><span></span></td></tr>
+            <tr class="skeleton-row"><td colspan="7"><span></span></td></tr>
+            <tr class="skeleton-row"><td colspan="7"><span></span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="edges-empty" class="empty-state">
+        <span><i class="bi bi-diagram-2"></i></span>
+        <h3>No graph edges found</h3>
+        <p>Run the graph traversal notebook and sync the results to Lakebase.</p>
+      </div>
+    </section>
+  </main>
 
-    async function loadEdges() {
-      const filter = document.getElementById("edge-filter").value;
-      const params = filter ? `?edge_type=${filter}` : "";
-      const edgesBody = document.getElementById("edges-body");
-      const emptyMsg = document.getElementById("edges-empty");
+  <div class="modal fade" id="feedback-dialog" tabindex="-1" aria-labelledby="feedback-dialog-title" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content feedback-modal">
+        <form id="feedback-form">
+          <div class="modal-header border-0 pb-0">
+            <div>
+              <span class="modal-icon"><i class="bi bi-hand-thumbs-down"></i></span>
+              <h2 class="modal-title h4 mt-3" id="feedback-dialog-title">Mark suggestion as bad</h2>
+            </div>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body pt-3">
+            <div class="edge-summary mb-4">
+              <code id="feedback-source"></code>
+              <i class="bi bi-arrow-right"></i>
+              <code id="feedback-target"></code>
+            </div>
+            <div class="mb-3">
+              <label for="feedback-package" class="form-label">Dependency or package <span class="text-danger">*</span></label>
+              <input type="text" class="form-control" id="feedback-package" name="package_name" placeholder="e.g. loose-envify" required>
+              <div class="form-text">This identifies the exact cached mapping the pipeline should improve.</div>
+            </div>
+            <div>
+              <label for="feedback-reason" class="form-label">Why is this suggestion incorrect? <span class="text-secondary">Optional</span></label>
+              <textarea class="form-control" id="feedback-reason" name="reason" rows="3" placeholder="Archived, unrelated, wrong project…"></textarea>
+            </div>
+          </div>
+          <div class="modal-footer border-0 pt-0">
+            <button type="button" class="btn btn-light" data-bs-dismiss="modal">Cancel</button>
+            <button type="submit" class="btn btn-danger" id="feedback-submit">
+              <i class="bi bi-hand-thumbs-down me-1"></i>Submit feedback
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
 
-      try {
-        const resp = await fetch("/graph/edges" + params);
-        const data = await resp.json();
-        if (!resp.ok) {
-          if (resp.status === 404) {
-            edgesBody.innerHTML = "";
-            emptyMsg.style.display = "block";
-            return;
-          }
-          return;
-        }
-        let filtered = data;
-        if (activeRepoFilter) {
-          filtered = data.filter(edge => edge.source === activeRepoFilter || edge.target === activeRepoFilter);
-        }
-        emptyMsg.style.display = filtered.length === 0 ? "block" : "none";
-        edgesBody.innerHTML = "";
-        filtered.forEach((edge) => {
-          const tr = document.createElement("tr");
-          let details = "";
-          let metadata = {};
-          if (edge.metadata) {
-            try {
-              metadata = typeof edge.metadata === "string" ? JSON.parse(edge.metadata) : edge.metadata;
-              if (metadata.source_repo) details = `from ${metadata.source_repo}`;
-              else if (metadata.validated) details = "✓ validated";
-              else details = Object.entries(metadata).map(([k,v]) => `${k}: ${v}`).join(", ");
-            } catch(e) { details = edge.metadata; }
-          }
-          const discovered = edge.discovered_at ? new Date(edge.discovered_at).toLocaleDateString() : "-";
-
-          const appendCell = (value, className = "") => {
-            const td = document.createElement("td");
-            td.textContent = value;
-            if (className) td.className = className;
-            tr.appendChild(td);
-            return td;
-          };
-
-          const sourceCell = appendCell("");
-          const sourceCode = document.createElement("code");
-          sourceCode.textContent = edge.source;
-          sourceCell.appendChild(sourceCode);
-          const arrowCell = appendCell("→");
-          arrowCell.style.textAlign = "center";
-          const targetCell = appendCell("");
-          const targetCode = document.createElement("code");
-          targetCode.textContent = edge.target;
-          targetCell.appendChild(targetCode);
-          appendCell(edge.edge_type);
-          appendCell(details, "hint");
-          appendCell(discovered, "hint");
-
-          const actionCell = appendCell("");
-          if (edge.edge_type === "ai_suggested") {
-            const button = document.createElement("button");
-            button.type = "button";
-            button.className = "feedback-btn";
-            button.textContent = "Mark as Bad";
-            button.addEventListener("click", () => openFeedbackDialog(edge, metadata));
-            actionCell.appendChild(button);
-          } else {
-            actionCell.textContent = "–";
-          }
-          edgesBody.appendChild(tr);
-        });
-      } catch (err) {
-        emptyMsg.style.display = "block";
-      }
-    }
-
-    function openFeedbackDialog(edge, metadata) {
-      feedbackEdge = edge;
-      document.getElementById("feedback-source").textContent = edge.source;
-      document.getElementById("feedback-target").textContent = edge.target;
-      document.getElementById("feedback-package").value = metadata.package_name || "";
-      document.getElementById("feedback-reason").value = "";
-      feedbackDialog.showModal();
-      document.getElementById("feedback-package").focus();
-    }
-
-    document.getElementById("feedback-cancel").addEventListener("click", () => {
-      feedbackDialog.close();
-    });
-
-    feedbackForm.addEventListener("submit", async (event) => {
-      event.preventDefault();
-      if (!feedbackEdge) return;
-
-      feedbackSubmit.disabled = true;
-      feedbackSubmit.textContent = "Submitting...";
-      feedbackStatus.className = "";
-
-      try {
-        const resp = await fetch("/graph/edges/feedback", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            source_repo: feedbackEdge.source,
-            package_name: document.getElementById("feedback-package").value,
-            suggested_repo: feedbackEdge.target,
-            feedback: "bad",
-            reason: document.getElementById("feedback-reason").value,
-          }),
-        });
-        const data = await resp.json();
-        if (!resp.ok) {
-          throw new Error(data.error || resp.statusText);
-        }
-
-        feedbackDialog.close();
-        feedbackStatus.textContent = `Feedback saved: ${data.suggested_repo} was marked as bad for ${data.package_name}.`;
-        feedbackStatus.className = "success";
-        feedbackEdge = null;
-      } catch (err) {
-        feedbackStatus.textContent = "Could not save feedback: " + err.message;
-        feedbackStatus.className = "error";
-        feedbackDialog.close();
-      } finally {
-        feedbackSubmit.disabled = false;
-        feedbackSubmit.textContent = "Submit feedback";
-      }
-    });
-
-    checkSchemaStatus();
-    loadRepos();
-    loadEdgeStats();
-    loadEdges();
-  </script>
+  <script
+    src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"
+    integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI"
+    crossorigin="anonymous"
+  ></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>
