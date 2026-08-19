@@ -22,22 +22,22 @@ The project demonstrates a practical LTAP pattern:
 ```mermaid
 flowchart LR
     user[Reviewer] --> ui[RepoSignal UI]
-    ui --> api[Flask API<br/>Databricks App]
+    ui --> api["Flask API - Databricks App"]
 
     api -->|Add or update repo| github[GitHub API]
     github -->|Repository metadata| api
-    api -->|Watchlist and feedback writes| operational[(Lakebase<br/>student_* schemas)]
+    api -->|Watchlist and feedback writes| operational[("Lakebase - student schemas")]
 
-    operational -->|Lakehouse Sync / CDC| history[(Unity Catalog Delta<br/>watchlist + feedback history)]
+    operational -->|Lakehouse Sync / CDC| history[("Unity Catalog Delta - watchlist and feedback history")]
     history --> traversal[Spark graph traversal]
     github -->|Trees, manifests, commits| traversal
 
     traversal -->|Cache miss| ai[Databricks ai_query]
     ai -->|Package to repository mappings| traversal
-    traversal <--> cache[(Delta<br/>ai_query_cache)]
-    traversal --> graph[(Delta<br/>github_api_staging + github_graph_edges)]
+    traversal <--> cache[("Delta - ai_query_cache")]
+    traversal --> graph[("Delta - github_api_staging and github_graph_edges")]
 
-    graph -->|Lakebase synced table| readmodel[(Lakebase read model<br/>uc_github_graph_edges)]
+    graph -->|Lakebase synced table| readmodel[("Lakebase read model - uc_github_graph_edges")]
     readmodel -->|Graph and statistics| api
     api --> ui
 
