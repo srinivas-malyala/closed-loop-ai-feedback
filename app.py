@@ -67,6 +67,16 @@ def _schema_for(username: str) -> str:
     return f"{STUDENT_SCHEMA_PREFIX}{username}"
 
 
+def _graph_schema_for(username: str) -> str:
+    """Return the Lakebase schema containing the read-only synced graph.
+
+    The writable application tables live in ``student_<username>``. The
+    Unity Catalog-to-Lakebase sync intentionally mirrors the student's UC
+    schema name instead, so user ``sri`` reads ``sri.uc_github_graph_edges``.
+    """
+    return username
+
+
 
 
 
@@ -312,7 +322,7 @@ def toggle_favorite():
 
 @app.route("/graph/edges", methods=["GET"])
 def get_graph_edges():
-    """Return graph edges from the synced Unity Catalog table (uc_github_graph_edges).
+    """Return graph edges from the read-only UC-to-Lakebase synced table.
     
     Optional query params:
       - edge_type: filter by type (dependency, ai_suggested)
@@ -323,6 +333,7 @@ def get_graph_edges():
     username = _current_username()
     if not username:
         return jsonify({"error": "Not signed in"}), 401
+    graph_schema = _graph_schema_for(username)
 
     edge_type = request.args.get("edge_type")
     source = request.args.get("source")
@@ -348,7 +359,7 @@ def get_graph_edges():
     try:
         rows = lakebase.run_query(
             f"SELECT source, target, edge_type, metadata, discovered_at "
-            f"FROM {username}.uc_github_graph_edges"
+            f"FROM {graph_schema}.uc_github_graph_edges"
             f"{where_clause} ORDER BY discovered_at DESC LIMIT %s",
             tuple(params),
         )
@@ -366,11 +377,12 @@ def get_graph_stats():
     username = _current_username()
     if not username:
         return jsonify({"error": "Not signed in"}), 401
+    graph_schema = _graph_schema_for(username)
 
     try:
         rows = lakebase.run_query(
             f"SELECT edge_type, COUNT(*) as count "
-            f"FROM {username}.uc_github_graph_edges "
+            f"FROM {graph_schema}.uc_github_graph_edges "
             f"GROUP BY edge_type ORDER BY count DESC"
         )
     except Exception as exc:
