@@ -1,4 +1,9 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
+
 
 # COMMAND ----------
 
@@ -32,7 +37,7 @@ from github_client import GitHubClient
 # COMMAND ----------
 
 dbutils.widgets.text("catalog", "bootcamp_students", "Unity Catalog name")
-dbutils.widgets.text("schema", "abhibastia", "Schema name")
+dbutils.widgets.text("schema", "sri", "Schema name")
 dbutils.widgets.text("target_repos", "500", "Target repos")
 dbutils.widgets.text("max_hops", "3", "Max hops")
 dbutils.widgets.text("fetch_mode", "graphql", "Fetch mode: graphql or rest")
@@ -47,6 +52,7 @@ repos_history_table = f"{catalog}.{schema}.lb_github_repos_history"
 github_staging_table = f"{catalog}.{schema}.github_api_staging"
 graph_edges_table = f"{catalog}.{schema}.github_graph_edges"
 ai_query_cache_table = f"{catalog}.{schema}.ai_query_cache"
+feedback_history_table = f"{catalog}.{schema}.lb_ai_suggestion_feedback_history"
 
 # Budget: GitHub REST API = 5000 req/hr. Track usage to avoid blowing the limit.
 MAX_GITHUB_REQUESTS_PER_RUN = 4000
@@ -135,8 +141,12 @@ repos_df = spark.sql(f"""
     WHERE rn = 1 AND _pg_change_type NOT IN('delete', 'update_preimage')
 """)
 repos = [row.asDict() for row in repos_df.collect()]
-
+print(f"Found (repos) repos")
 _github_token = dbutils.secrets.get(scope="github", key="token")
+
+# COMMAND ----------
+
+repos_df.display()
 
 # COMMAND ----------
 
@@ -478,8 +488,93 @@ Rules:
 - ONLY suggest repos you are confident exist on GitHub in "owner/repo" format
 - Focus on the most significant/popular dependencies, skip trivial ones
 - Do NOT suggest the source repo itself
-- Respond ONLY with a JSON object mapping package names to repos, e.g.: {"package1": "owner/repo1", "package2": "owner/repo2"}
-- If you cannot determine any repos, respond with: {}"""
+- Respond ONLY with a JSON object mapping package names to repos, e.g.: {{"package1": "owner/repo1", "package2": "owner/repo2"}}
+- If you cannot determine any repos, respond with: {{}}"""
+
+
+def load_blocked_ai_suggestions():
+    """Load current bad-feedback mappings and remove them from the AI cache."""
+    try:
+        blocked_df = spark.sql(f"""
+            WITH latest_feedback AS (
+                SELECT
+                    source_repo,
+                    package_name,
+                    suggested_repo,
+                    feedback,
+                    _pg_change_type,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY source_repo, package_name, suggested_repo
+                        ORDER BY _sort_by DESC
+                    ) AS rn
+                FROM {feedback_history_table}
+                WHERE _pg_change_type != 'update_preimage'
+            )
+            SELECT source_repo, package_name, suggested_repo
+            FROM latest_feedback
+            WHERE rn = 1
+              AND _pg_change_type != 'delete'
+              AND feedback = 'bad'
+        """).dropDuplicates()
+        blocked_rows = blocked_df.collect()
+    except Exception as e:
+        print(f"    ⚠ Could not load AI suggestion feedback from {feedback_history_table}: {e}")
+        return set(), set()
+
+    blocked_set = {
+        (row["source_repo"], row["package_name"], row["suggested_repo"])
+        for row in blocked_rows
+    }
+    if not blocked_set:
+        return blocked_set, set()
+
+    invalidated_sources = set()
+    try:
+        if spark.catalog.tableExists(ai_query_cache_table):
+            invalidated_sources = {
+                row["source_repo"]
+                for row in spark.table(ai_query_cache_table).join(
+                    blocked_df,
+                    on=["source_repo", "package_name", "suggested_repo"],
+                    how="inner",
+                ).select("source_repo").distinct().collect()
+            }
+            from delta.tables import DeltaTable
+            DeltaTable.forName(spark, ai_query_cache_table).alias("cache").merge(
+                blocked_df.alias("blocked"),
+                "cache.source_repo = blocked.source_repo AND "
+                "cache.package_name = blocked.package_name AND "
+                "cache.suggested_repo = blocked.suggested_repo",
+            ).whenMatchedDelete().execute()
+            print(f"    ✓ Removed {len(blocked_set)} blocked mapping(s) from the AI query cache")
+    except Exception as e:
+        # Keep enforcing the in-memory block even if cache cleanup fails.
+        print(f"    ⚠ Could not remove blocked mappings from {ai_query_cache_table}: {e}")
+
+    return blocked_set, invalidated_sources
+
+
+def write_ai_query_cache(cache_rows):
+    """Insert new cache mappings without duplicating mappings already retained."""
+    if not cache_rows:
+        return
+
+    cache_df = spark.createDataFrame(
+        cache_rows,
+        schema=["source_repo", "package_name", "suggested_repo", "model_name"],
+    ).dropDuplicates(["source_repo", "package_name", "suggested_repo"])
+
+    if not spark.catalog.tableExists(ai_query_cache_table):
+        cache_df.write.format("delta").saveAsTable(ai_query_cache_table)
+        return
+
+    from delta.tables import DeltaTable
+    DeltaTable.forName(spark, ai_query_cache_table).alias("cache").merge(
+        cache_df.alias("updates"),
+        "cache.source_repo = updates.source_repo AND "
+        "cache.package_name = updates.package_name AND "
+        "cache.suggested_repo = updates.suggested_repo",
+    ).whenNotMatchedInsertAll().execute()
 
 
 def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
@@ -488,6 +583,8 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
     Validates suggestions exist on GitHub (up to 50 per hop).
     """
     global _github_request_count
+
+    blocked_set, invalidated_sources = load_blocked_ai_suggestions()
 
     dep_contents_df = staging_df.filter(
         "category = 'content' AND path IN ('package.json', 'requirements.txt', 'setup.py', "
@@ -521,6 +618,16 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
         except Exception:
             cached_rows = []
 
+        cached_rows = [
+            row for row in cached_rows
+            if (source_repo, row["package_name"], row["suggested_repo"]) not in blocked_set
+        ]
+        if source_repo in invalidated_sources:
+            # A rejected mapping invalidates this source's cache for this run, so
+            # ai_query gets another opportunity to return a better replacement.
+            cached_rows = []
+            print(f"    ↻ Cache invalidated for {source_repo} by human feedback")
+
         if cached_rows:
             print(f"    ✓ Cache hit for {source_repo} ({len(cached_rows)} mappings)")
             for row in cached_rows:
@@ -548,21 +655,27 @@ def discover_repos_from_dependencies_ai(staging_df, already_seen, client):
 
             suggested_map = json.loads(response_text)
             if isinstance(suggested_map, dict):
+                allowed_suggestions = [
+                    (pkg, repo)
+                    for pkg, repo in suggested_map.items()
+                    if isinstance(pkg, str)
+                    and isinstance(repo, str)
+                    and "/" in repo
+                    and (source_repo, pkg, repo) not in blocked_set
+                ]
+                suppressed_count = len(suggested_map) - len(allowed_suggestions)
+                if suppressed_count:
+                    print(f"    ✓ Suppressed {suppressed_count} blocked or invalid AI suggestion(s)")
+
                 # Write package→repo mappings to cache
                 cache_rows = [
                     (source_repo, pkg, repo, "databricks-meta-llama-3-3-70b-instruct")
-                    for pkg, repo in suggested_map.items()
-                    if isinstance(repo, str) and "/" in repo
+                    for pkg, repo in allowed_suggestions
                 ]
-                if cache_rows:
-                    cache_df = spark.createDataFrame(
-                        cache_rows,
-                        schema=["source_repo", "package_name", "suggested_repo", "model_name"],
-                    )
-                    cache_df.write.format("delta").mode("append").saveAsTable(ai_query_cache_table)
+                write_ai_query_cache(cache_rows)
 
-                for pkg, suggested in suggested_map.items():
-                    if isinstance(suggested, str) and "/" in suggested and suggested not in already_seen:
+                for pkg, suggested in allowed_suggestions:
+                    if suggested not in already_seen:
                         ai_suggestions.append((source_repo, suggested))
                         record_edge(source_repo, suggested, "dependency", {"discovered_by": "ai_query"})
         except Exception as e:
@@ -622,7 +735,7 @@ def record_edge(source, target, edge_type, metadata=None):
 
 
 def write_graph_edges():
-    """Persist accumulated graph edges to a Delta table."""
+    """Persist accumulated graph edges to a Delta table via MERGE (keyed on source, target)."""
     if not _graph_edges:
         return
     edges_schema = StructType([
@@ -633,8 +746,19 @@ def write_graph_edges():
         StructField("discovered_at", StringType(), False),
     ])
     edges_df = spark.createDataFrame(_graph_edges, schema=edges_schema)
-    edges_df.write.format("delta").mode("append").option("mergeSchema", "true").saveAsTable(graph_edges_table)
-    print(f"  ✓ Wrote {len(_graph_edges)} graph edges to {graph_edges_table}")
+
+    # Ensure target table exists
+    if not spark.catalog.tableExists(graph_edges_table):
+        edges_df.write.format("delta").option("mergeSchema", "true").saveAsTable(graph_edges_table)
+    else:
+        from delta.tables import DeltaTable
+        target_table = DeltaTable.forName(spark, graph_edges_table)
+        target_table.alias("t").merge(
+            edges_df.dropDuplicates(['source', 'target']).alias("s"),
+            "t.source = s.source AND t.target = s.target"
+        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+
+    print(f"  ✓ Merged {len(_graph_edges)} graph edges into {graph_edges_table}")
 
 # COMMAND ----------
 
@@ -679,6 +803,7 @@ driver_client = GitHubClient(token=_github_token)
 
 # COMMAND ----------
 
+staging_df = spark.table(github_staging_table)
 for hop in range(1, MAX_HOPS + 1):
     if len(all_fetched) >= TARGET_REPOS:
         break
@@ -687,7 +812,7 @@ for hop in range(1, MAX_HOPS + 1):
         break
 
     print(f"\n--- Hop {hop}/{MAX_HOPS} (fetched so far: {len(all_fetched)}) ---")
-    staging_df = spark.table(github_staging_table)
+
 
     # --- Discovery: AI dependency analysis ---
     print(f"  AI dependency discovery:")
