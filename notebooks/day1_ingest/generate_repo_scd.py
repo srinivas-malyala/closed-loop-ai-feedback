@@ -11,12 +11,28 @@
 # COMMAND ----------
 
 # DBTITLE 1,Configuration
-# Source and target configuration
-SOURCE_TABLE = "bootcamp_students.abhibastia.lb_github_repos_history"
-TARGET_TABLE = "bootcamp_students.abhibastia.github_repos_scd"
+import re
+
+dbutils.widgets.text("catalog", "bootcamp_students", "Unity Catalog name")
+dbutils.widgets.text("schema", "sri", "Schema name")
+
+catalog = dbutils.widgets.get("catalog").strip()
+schema = dbutils.widgets.get("schema").strip()
+
+identifier_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+for parameter_name, parameter_value in (("catalog", catalog), ("schema", schema)):
+    if not identifier_pattern.fullmatch(parameter_value):
+        raise ValueError(
+            f"Invalid {parameter_name} identifier: {parameter_value!r}. "
+            "Use letters, numbers, and underscores, starting with a letter or underscore."
+        )
+
+# Source and target configuration derived from the notebook task parameters.
+SOURCE_TABLE = f"{catalog}.{schema}.lb_github_repos_history"
+TARGET_TABLE = f"{catalog}.{schema}.github_repos_scd"
 
 # Watermark table tracks last processed _sort_by per source
-WATERMARK_TABLE = "bootcamp_students.abhibastia.scd_watermarks"
+WATERMARK_TABLE = f"{catalog}.{schema}.scd_watermarks"
 
 # COMMAND ----------
 

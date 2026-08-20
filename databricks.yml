@@ -42,7 +42,7 @@ resources:
         table_update:
           condition: ALL_UPDATED
           table_names:
-            - "bootcamp_student.sri.lb_github_repos_history"
+            - "bootcamp_students.sri.lb_github_repos_history"
           min_time_between_triggers_seconds: 60
           wait_after_last_change_seconds: 60
 
@@ -51,8 +51,8 @@ resources:
           notebook_task:
             notebook_path: ./notebooks/day1_ingest/generate_repo_scd.py
             base_parameters:
-              catalog: "bootcamp"
-              schema: "ltap_lab_day1"
+              catalog: "bootcamp_students"
+              schema: "sri"
 
     github_graph_traversal_on_feedback:
       name: "GitHub Graph Traversal (triggered by AI feedback)"
