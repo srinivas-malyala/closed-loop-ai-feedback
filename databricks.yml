@@ -1,6 +1,14 @@
 bundle:
   name: week1-homework
 
+variables:
+  catalog:
+    description: Unity Catalog containing the application tables.
+    default: "bootcamp_students"
+  schema:
+    description: Schema containing the application tables.
+    default: "sri"
+
 resources:
   apps:
     week1_homework:
@@ -42,7 +50,7 @@ resources:
         table_update:
           condition: ALL_UPDATED
           table_names:
-            - "bootcamp_students.sri.lb_github_repos_history"
+            - "${var.catalog}.${var.schema}.lb_github_repos_history"
           min_time_between_triggers_seconds: 60
           wait_after_last_change_seconds: 60
 
@@ -51,8 +59,8 @@ resources:
           notebook_task:
             notebook_path: ./notebooks/day1_ingest/generate_repo_scd.py
             base_parameters:
-              catalog: "bootcamp_students"
-              schema: "sri"
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
 
     github_graph_traversal_on_feedback:
       name: "GitHub Graph Traversal (triggered by AI feedback)"
@@ -66,7 +74,7 @@ resources:
         table_update:
           condition: ANY_UPDATED
           table_names:
-            - "bootcamp_students.sri.lb_ai_suggestion_feedback_history"
+            - "${var.catalog}.${var.schema}.lb_ai_suggestion_feedback_history"
           min_time_between_triggers_seconds: 60
           wait_after_last_change_seconds: 60
 
@@ -75,8 +83,8 @@ resources:
           notebook_task:
             notebook_path: "./notebooks/day2_processing/github graph traversal.py"
             base_parameters:
-              catalog: "bootcamp_students"
-              schema: "sri"
+              catalog: "${var.catalog}"
+              schema: "${var.schema}"
               target_repos: "500"
               max_hops: "3"
               fetch_mode: "graphql"
