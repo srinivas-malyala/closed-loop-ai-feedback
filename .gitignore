@@ -1,3 +1,6 @@
 .idea/
 
+# Local deployment verification may contain CLI profile and workspace metadata.
+DEPLOYMENT_VERIFICATION.md
+
 __pycache__/
